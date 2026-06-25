@@ -256,10 +256,10 @@ slm-rag/
 
 ## Status
 
-Design stage -- this README is the spec. Next: scaffold `serve.py` (ingestion +
-retrieval + chat, plus the `--cli` terminal chat and the signal/`/shutdown` teardown,
-both reusing merv's pattern), the two-panel `index.html`, the SQLite schema, and the
-Colab fine-tune notebook.
+Design stage -- this README is the spec. The build is broken into independently
+testable phases in **[PLAN.md](PLAN.md)** (each phase ends with a `curl`/CLI acceptance
+test). First slice: the `serve.py` skeleton + lifecycle (P0) and, in parallel, the
+SQLite/sqlite-vec store (P1) and the text-extraction/chunking module (P2).
 
 ## Notes
 
