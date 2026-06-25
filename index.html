@@ -5,26 +5,948 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>slm-rag</title>
   <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
     body {
-      font-family: system-ui, sans-serif;
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: #f5f5f5;
+      color: #222;
+    }
+
+    header {
+      background: #1a1a2e;
+      color: #fff;
+      padding: 0.6rem 1.2rem;
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      flex-shrink: 0;
+    }
+    header span.tagline {
+      font-weight: 400;
+      font-size: 0.8rem;
+      opacity: 0.6;
+    }
+
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Left panel: file tree ─────────────────────────────────────── */
+    .panel-left {
+      width: 300px;
+      min-width: 180px;
+      max-width: 480px;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #ddd;
+      background: #fff;
+      resize: horizontal;
+      overflow: hidden;
+    }
+
+    .panel-left-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.6rem 0.8rem;
+      border-bottom: 1px solid #eee;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #555;
+      flex-shrink: 0;
+    }
+
+    #upload-btn {
+      font-size: 0.75rem;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 0.3rem 0.6rem;
+      cursor: pointer;
+    }
+    #upload-btn:hover { background: #2d2d5c; }
+
+    #file-input { display: none; }
+
+    .drop-zone {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.4rem;
+      position: relative;
+    }
+    .drop-zone.drag-over {
+      background: #eef2ff;
+      outline: 2px dashed #6366f1;
+      outline-offset: -4px;
+    }
+
+    .drop-hint {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-      background: #f8f9fa;
-      color: #333;
+      height: 100%;
+      color: #aaa;
+      font-size: 0.8rem;
+      text-align: center;
+      padding: 1rem;
+      gap: 0.4rem;
+      pointer-events: none;
     }
-    h1 { font-size: 2rem; margin-bottom: 0.4rem; }
-    p  { color: #666; margin: 0; }
+    .drop-hint svg { opacity: 0.35; }
+
+    .tree-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    .tree-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.5rem;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      transition: background 0.1s;
+    }
+    .tree-item:hover { background: #f0f0f0; }
+    .tree-item.active { background: #eef2ff; color: #4338ca; }
+
+    .tree-item .item-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .badge {
+      font-size: 0.65rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 99px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .badge-vectorizing { background: #fef9c3; color: #854d0e; }
+    .badge-ready       { background: #dcfce7; color: #166534; }
+    .badge-error       { background: #fee2e2; color: #991b1b; }
+    .badge-pending     { background: #f3f4f6; color: #6b7280; }
+
+    /* ── Right panel: chat ─────────────────────────────────────────── */
+    .panel-right {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .chat-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid #eee;
+      background: #fff;
+      flex-shrink: 0;
+    }
+    .chat-toolbar-label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #555;
+    }
+    #new-chat-btn {
+      font-size: 0.75rem;
+      background: #fff;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 0.3rem 0.7rem;
+      cursor: pointer;
+      color: #444;
+    }
+    #new-chat-btn:hover { background: #f0f0f0; }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .msg {
+      max-width: 80%;
+      padding: 0.6rem 0.9rem;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg-user {
+      align-self: flex-end;
+      background: #1a1a2e;
+      color: #fff;
+    }
+    .msg-assistant {
+      align-self: flex-start;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      max-width: 90%;
+    }
+    .msg-system {
+      align-self: center;
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      color: #6b7280;
+      font-size: 0.78rem;
+      max-width: 90%;
+    }
+
+    /* Citations inside assistant messages */
+    .citation {
+      display: inline;
+      color: #4338ca;
+      text-decoration: underline;
+      cursor: pointer;
+      font-size: 0.82em;
+    }
+    .citation:hover { color: #6366f1; }
+
+    /* Thinking indicator */
+    .thinking {
+      align-self: flex-start;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 0.6rem 0.9rem;
+      font-size: 0.82rem;
+      color: #9ca3af;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .thinking-dots span {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #9ca3af;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes pulse {
+      0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+      40%           { transform: scale(1);   opacity: 1;   }
+    }
+
+    /* Fix-it control */
+    .fix-it-ctrl {
+      margin-top: 0.5rem;
+      font-size: 0.75rem;
+      color: #9ca3af;
+    }
+    .fix-it-btn {
+      background: none;
+      border: none;
+      color: #9ca3af;
+      font-size: 0.75rem;
+      cursor: pointer;
+      padding: 0;
+      text-decoration: underline;
+    }
+    .fix-it-btn:hover { color: #4b5563; }
+
+    .fix-it-form {
+      margin-top: 0.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .fix-it-form textarea {
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      padding: 0.4rem;
+      font-size: 0.82rem;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 3rem;
+    }
+    .fix-it-form-btns {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .fix-it-submit {
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+    .fix-it-submit:hover { background: #2d2d5c; }
+    .fix-it-cancel {
+      background: #fff;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+
+    /* Chat input area */
+    .chat-input-area {
+      padding: 0.8rem 1rem;
+      border-top: 1px solid #eee;
+      background: #fff;
+      display: flex;
+      gap: 0.6rem;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+    #chat-input {
+      flex: 1;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      padding: 0.55rem 0.8rem;
+      font-size: 0.88rem;
+      font-family: inherit;
+      resize: none;
+      min-height: 2.4rem;
+      max-height: 8rem;
+      line-height: 1.4;
+      overflow-y: auto;
+    }
+    #chat-input:focus { outline: 2px solid #6366f1; border-color: transparent; }
+    #send-btn {
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.55rem 1rem;
+      cursor: pointer;
+      font-size: 0.88rem;
+      flex-shrink: 0;
+    }
+    #send-btn:hover { background: #2d2d5c; }
+    #send-btn:disabled { background: #9ca3af; cursor: not-allowed; }
+
+    /* Doc preview modal */
+    .preview-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+    .preview-overlay.open { display: flex; }
+
+    .preview-modal {
+      background: #fff;
+      border-radius: 8px;
+      width: min(90vw, 700px);
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+      overflow: hidden;
+    }
+    .preview-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.7rem 1rem;
+      border-bottom: 1px solid #eee;
+      font-size: 0.85rem;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .preview-close {
+      background: none;
+      border: none;
+      font-size: 1.2rem;
+      cursor: pointer;
+      color: #555;
+      padding: 0;
+      line-height: 1;
+    }
+    .preview-body {
+      overflow-y: auto;
+      padding: 0.8rem 1rem;
+      flex: 1;
+    }
+    .chunk-block {
+      margin-bottom: 1rem;
+      padding: 0.6rem 0.8rem;
+      background: #f9fafb;
+      border-left: 3px solid #e5e7eb;
+      border-radius: 0 4px 4px 0;
+      font-size: 0.82rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.55;
+    }
+    .chunk-block.highlighted {
+      border-left-color: #6366f1;
+      background: #eef2ff;
+    }
+    .chunk-label {
+      font-size: 0.72rem;
+      color: #9ca3af;
+      margin-bottom: 0.3rem;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
-  <h1>slm-rag</h1>
-  <p>Portable, self-improving RAG over your own files.</p>
-  <p style="margin-top:1rem;font-size:0.85rem;color:#999;">
-    P0 skeleton — full two-panel UI coming in P8.
-  </p>
+
+<header>
+  slm-rag
+  <span class="tagline">portable, self-improving RAG over your own files</span>
+</header>
+
+<div class="main">
+
+  <!-- ── LEFT PANEL: file tree ────────────────────────────────── -->
+  <div class="panel-left">
+    <div class="panel-left-header">
+      Documents
+      <button id="upload-btn" title="Click to upload a file">+ Upload</button>
+      <input type="file" id="file-input" accept=".txt,.md,.pdf" />
+    </div>
+    <div class="drop-zone" id="drop-zone">
+      <div class="drop-hint" id="drop-hint">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="1.5">
+          <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>
+          <polyline points="16 12 12 8 8 12"/>
+          <line x1="12" y1="8" x2="12" y2="20"/>
+        </svg>
+        <div>Drag a file here to ingest it</div>
+        <div style="font-size:0.72rem;opacity:0.7">.txt · .md · .pdf</div>
+      </div>
+      <ul class="tree-list" id="tree-list"></ul>
+    </div>
+  </div>
+
+  <!-- ── RIGHT PANEL: chat ─────────────────────────────────────── -->
+  <div class="panel-right">
+    <div class="chat-toolbar">
+      <span class="chat-toolbar-label">Chat</span>
+      <button id="new-chat-btn" title="Start a new conversation">New conversation</button>
+    </div>
+    <div class="chat-messages" id="chat-messages">
+      <div class="msg msg-system">
+        Ask a question about your ingested documents. Answers cite their sources — click a citation to preview the source.
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <textarea id="chat-input" rows="1" placeholder="Ask a question…"></textarea>
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Doc preview modal ─────────────────────────────────────── -->
+<div class="preview-overlay" id="preview-overlay">
+  <div class="preview-modal">
+    <div class="preview-header">
+      <span id="preview-title">Document preview</span>
+      <button class="preview-close" id="preview-close" aria-label="Close">×</button>
+    </div>
+    <div class="preview-body" id="preview-body"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────
+let sessionId = null;        // minted on first enqueue, held until /clear
+let treePoller = null;       // setInterval handle for tree refresh
+let pendingRid  = null;      // request_id currently being polled
+let answerPoller = null;     // setInterval handle while polling for answer
+
+const TREE_POLL_MS    = 3000;
+const ANSWER_POLL_MS  = 3000;
+const ANSWER_TIMEOUT_MS = 12 * 60 * 1000;  // 12 min (model load + generation)
+
+// ── DOM refs ───────────────────────────────────────────────────
+const treeList     = document.getElementById('tree-list');
+const dropHint     = document.getElementById('drop-hint');
+const dropZone     = document.getElementById('drop-zone');
+const fileInput    = document.getElementById('file-input');
+const uploadBtn    = document.getElementById('upload-btn');
+const chatMessages = document.getElementById('chat-messages');
+const chatInput    = document.getElementById('chat-input');
+const sendBtn      = document.getElementById('send-btn');
+const newChatBtn   = document.getElementById('new-chat-btn');
+const previewOverlay = document.getElementById('preview-overlay');
+const previewTitle   = document.getElementById('preview-title');
+const previewBody    = document.getElementById('preview-body');
+const previewClose   = document.getElementById('preview-close');
+
+// ── Utilities ──────────────────────────────────────────────────
+
+async function apiFetch(method, path, body, isFormData) {
+  const opts = { method };
+  if (body !== undefined && body !== null) {
+    if (isFormData) {
+      opts.body = body;
+    } else {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+  }
+  const resp = await fetch(path, opts);
+  const text = await resp.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { _raw: text }; }
+  return { status: resp.status, ok: resp.ok, json };
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+          .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── File tree ──────────────────────────────────────────────────
+
+let lastTreeData = [];
+
+async function fetchTree() {
+  try {
+    const { json } = await apiFetch('GET', '/tree');
+    const files = json.files || [];
+    renderTree(files);
+    lastTreeData = files;
+  } catch (e) {
+    console.error('tree fetch error', e);
+  }
+}
+
+function renderTree(files) {
+  if (files.length === 0) {
+    dropHint.style.display = 'flex';
+    treeList.innerHTML = '';
+    return;
+  }
+  dropHint.style.display = 'none';
+  treeList.innerHTML = files.map(f => {
+    const badgeClass = 'badge badge-' + (f.status || 'pending');
+    const badgeLabel = f.status === 'ready'
+      ? `ready · ${f.chunk_count} chunks`
+      : (f.status || 'pending');
+    return `<li class="tree-item" data-path="${escapeHtml(f.path)}"
+               title="${escapeHtml(f.path)}">
+      <span class="item-name">${escapeHtml(f.path)}</span>
+      <span class="${badgeClass}">${escapeHtml(badgeLabel)}</span>
+    </li>`;
+  }).join('');
+
+  // Click to preview
+  treeList.querySelectorAll('.tree-item').forEach(li => {
+    li.addEventListener('click', () => {
+      treeList.querySelectorAll('.tree-item').forEach(x => x.classList.remove('active'));
+      li.classList.add('active');
+      openPreview(li.dataset.path, null);
+    });
+  });
+}
+
+// ── Drag-and-drop upload ───────────────────────────────────────
+
+dropZone.addEventListener('dragover', e => {
+  e.preventDefault();
+  dropZone.classList.add('drag-over');
+});
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const files = Array.from(e.dataTransfer.files);
+  files.forEach(uploadFile);
+});
+
+// Click-to-upload fallback
+uploadBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  Array.from(fileInput.files).forEach(uploadFile);
+  fileInput.value = '';
+});
+
+async function uploadFile(file) {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  try {
+    const { status, json } = await apiFetch('POST', '/ingest', form, true);
+    if (status === 200) {
+      console.log('ingest queued', json);
+      fetchTree();
+    } else {
+      console.error('ingest error', json);
+    }
+  } catch (e) {
+    console.error('upload failed', e);
+  }
+}
+
+// ── Doc preview modal ──────────────────────────────────────────
+
+let currentPreviewPath = null;
+
+async function openPreview(path, highlightChunk) {
+  currentPreviewPath = path;
+  previewTitle.textContent = path;
+  previewBody.innerHTML = '<em style="color:#9ca3af;font-size:0.82rem">Loading…</em>';
+  previewOverlay.classList.add('open');
+  try {
+    const { json } = await apiFetch('GET', `/doc?path=${encodeURIComponent(path)}`);
+    const chunks = json.chunks || [];
+    if (chunks.length === 0) {
+      previewBody.innerHTML = '<em style="color:#9ca3af;font-size:0.82rem">No chunks yet (still vectorizing).</em>';
+      return;
+    }
+    previewBody.innerHTML = chunks.map(c => {
+      const isHl = (highlightChunk !== null && highlightChunk !== undefined &&
+                    c.chunk_index === highlightChunk);
+      return `<div class="chunk-block${isHl ? ' highlighted' : ''}"
+                   id="chunk-${c.chunk_index}">
+        <div class="chunk-label">chunk ${c.chunk_index}</div>
+        ${escapeHtml(c.text)}
+      </div>`;
+    }).join('');
+    if (highlightChunk !== null && highlightChunk !== undefined) {
+      const el = document.getElementById('chunk-' + highlightChunk);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  } catch (e) {
+    previewBody.innerHTML = '<em style="color:#c00;font-size:0.82rem">Failed to load preview.</em>';
+  }
+}
+
+previewClose.addEventListener('click', () => previewOverlay.classList.remove('open'));
+previewOverlay.addEventListener('click', e => {
+  if (e.target === previewOverlay) previewOverlay.classList.remove('open');
+});
+
+// ── Citations ──────────────────────────────────────────────────
+// Citations have the form [Source: <path>, chunk <n>]
+// We render them as clickable spans that open the doc preview at that chunk.
+
+function renderCitations(text) {
+  // Match [Source: <path>, chunk <n>]
+  // Path can contain spaces and punctuation but not ']'
+  return text.replace(/\[Source:\s*([^\],]+),\s*chunk\s*(\d+)\]/g,
+    (match, path, chunkStr) => {
+      const p = path.trim();
+      const n = parseInt(chunkStr, 10);
+      return `<span class="citation" data-path="${escapeHtml(p)}" data-chunk="${n}"
+                    title="Jump to ${escapeHtml(p)}, chunk ${n}">${escapeHtml(match)}</span>`;
+    });
+}
+
+function attachCitationClicks(el) {
+  el.querySelectorAll('.citation').forEach(span => {
+    span.addEventListener('click', () => {
+      const path = span.dataset.path;
+      const chunk = parseInt(span.dataset.chunk, 10);
+      // Highlight the cited file in the tree
+      treeList.querySelectorAll('.tree-item').forEach(li => {
+        li.classList.toggle('active', li.dataset.path === path);
+      });
+      openPreview(path, chunk);
+    });
+  });
+}
+
+// ── Chat ───────────────────────────────────────────────────────
+
+function appendMessage(role, htmlContent, dataset) {
+  const div = document.createElement('div');
+  div.className = 'msg msg-' + role;
+  if (dataset) Object.assign(div.dataset, dataset);
+  div.innerHTML = htmlContent;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return div;
+}
+
+function showThinking() {
+  const div = document.createElement('div');
+  div.className = 'thinking';
+  div.id = 'thinking-indicator';
+  div.innerHTML = `<span>Thinking</span><span class="thinking-dots">
+    <span></span><span></span><span></span></span>`;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function removeThinking() {
+  const el = document.getElementById('thinking-indicator');
+  if (el) el.remove();
+}
+
+// Build a fix-it control for an assistant message.
+// /correct is built in P9 and does not exist yet — the control is wired here
+// so the UI is complete, but a 404 is expected until P9 ships.
+function buildFixItControl(questionText, answerText) {
+  const ctrl = document.createElement('div');
+  ctrl.className = 'fix-it-ctrl';
+
+  const btn = document.createElement('button');
+  btn.className = 'fix-it-btn';
+  btn.textContent = 'This is wrong → fix it';
+  ctrl.appendChild(btn);
+
+  const form = document.createElement('div');
+  form.className = 'fix-it-form';
+  form.style.display = 'none';
+
+  const ta = document.createElement('textarea');
+  ta.value = answerText;
+  ta.placeholder = 'Write the correct answer here…';
+  form.appendChild(ta);
+
+  const btns = document.createElement('div');
+  btns.className = 'fix-it-form-btns';
+
+  const submit = document.createElement('button');
+  submit.className = 'fix-it-submit';
+  submit.textContent = 'Submit correction';
+
+  const cancel = document.createElement('button');
+  cancel.className = 'fix-it-cancel';
+  cancel.textContent = 'Cancel';
+
+  btns.appendChild(submit);
+  btns.appendChild(cancel);
+  form.appendChild(btns);
+  ctrl.appendChild(form);
+
+  btn.addEventListener('click', () => {
+    form.style.display = form.style.display === 'none' ? 'block' : 'none';
+  });
+  cancel.addEventListener('click', () => { form.style.display = 'none'; });
+  submit.addEventListener('click', async () => {
+    // NOTE: POST /correct is implemented in P9. Until then this will 404.
+    const correctedAnswer = ta.value.trim();
+    if (!correctedAnswer) return;
+    submit.disabled = true;
+    submit.textContent = 'Sending…';
+    try {
+      const { status, json } = await apiFetch('POST', '/correct', {
+        question: questionText,
+        context: '',   // context not stored client-side; server can recover from DB
+        answer: correctedAnswer,
+      });
+      if (status === 200) {
+        form.style.display = 'none';
+        btn.textContent = 'Correction saved ✓';
+        btn.disabled = true;
+      } else {
+        submit.disabled = false;
+        submit.textContent = 'Submit correction';
+        alert('Could not save correction (server returned ' + status + '). ' +
+              '/correct will be available in P9.');
+      }
+    } catch (e) {
+      submit.disabled = false;
+      submit.textContent = 'Submit correction';
+      console.error('correct error', e);
+    }
+  });
+
+  return ctrl;
+}
+
+// Repaint the whole conversation from GET /history.
+// The transcript is server-side state — never maintained separately client-side.
+async function repaintHistory(sid) {
+  try {
+    const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
+    const msgs = json.messages || [];
+    // Clear existing conversation messages but keep the intro system message.
+    const systemMsg = chatMessages.querySelector('.msg-system');
+    chatMessages.innerHTML = '';
+    if (systemMsg) chatMessages.appendChild(systemMsg);
+
+    // Track the last user question so we can associate it with the answer for fix-it.
+    let lastUserQuestion = '';
+    for (const m of msgs) {
+      if (m.role === 'user') {
+        lastUserQuestion = m.content || '';
+        appendMessage('user', escapeHtml(m.content || ''));
+      } else if (m.role === 'assistant') {
+        const rawContent = m.content || '';
+        const htmlContent = renderCitations(escapeHtml(rawContent));
+        const msgEl = appendMessage('assistant', htmlContent);
+        attachCitationClicks(msgEl);
+        // Attach fix-it control to every completed assistant message.
+        const fixIt = buildFixItControl(lastUserQuestion, rawContent);
+        msgEl.appendChild(fixIt);
+      }
+    }
+  } catch (e) {
+    console.error('history fetch error', e);
+  }
+}
+
+async function sendQuestion() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  if (pendingRid) return;  // one at a time
+
+  chatInput.value = '';
+  chatInput.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  // Optimistic user bubble
+  appendMessage('user', escapeHtml(text));
+  showThinking();
+
+  // POST /enqueue {kind:chat, content, session_id}
+  let rid, sid;
+  try {
+    const { status, json } = await apiFetch('POST', '/enqueue', {
+      kind: 'chat',
+      content: text,
+      session_id: sessionId || undefined,
+    });
+    if (status !== 200) {
+      removeThinking();
+      appendMessage('system', 'Error: could not enqueue question (' +
+                    escapeHtml(JSON.stringify(json)) + ')');
+      sendBtn.disabled = false;
+      return;
+    }
+    rid = json.request_id;
+    sid = json.session_id;
+    sessionId = sid;
+  } catch (e) {
+    removeThinking();
+    appendMessage('system', 'Network error: ' + escapeHtml(String(e)));
+    sendBtn.disabled = false;
+    return;
+  }
+
+  // Poll GET /request?id=<rid> until done or error
+  pendingRid = rid;
+  const deadline = Date.now() + ANSWER_TIMEOUT_MS;
+
+  if (answerPoller) clearInterval(answerPoller);
+  answerPoller = setInterval(async () => {
+    if (Date.now() > deadline) {
+      clearInterval(answerPoller);
+      answerPoller = null;
+      pendingRid = null;
+      removeThinking();
+      appendMessage('system', 'Timed out waiting for answer.');
+      sendBtn.disabled = false;
+      return;
+    }
+    try {
+      const { json: reqJson } = await apiFetch('GET', `/request?id=${encodeURIComponent(rid)}`);
+      const status = reqJson.status;
+      if (status === 'done' || status === 'error') {
+        clearInterval(answerPoller);
+        answerPoller = null;
+        pendingRid = null;
+        removeThinking();
+        if (status === 'error') {
+          appendMessage('system', 'Generation error: ' + escapeHtml(reqJson.error || 'unknown'));
+        } else {
+          // Repaint the full conversation from server history
+          await repaintHistory(sessionId);
+        }
+        sendBtn.disabled = false;
+      }
+    } catch (e) {
+      console.error('poll error', e);
+    }
+  }, ANSWER_POLL_MS);
+}
+
+sendBtn.addEventListener('click', sendQuestion);
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendQuestion();
+  }
+});
+// Auto-resize textarea
+chatInput.addEventListener('input', () => {
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 128) + 'px';
+});
+
+// ── New conversation / clear ───────────────────────────────────
+newChatBtn.addEventListener('click', async () => {
+  if (pendingRid) return;  // don't clear mid-answer
+  if (sessionId) {
+    try {
+      await apiFetch('POST', '/clear', { session_id: sessionId });
+    } catch (e) {
+      console.error('clear error', e);
+    }
+  }
+  sessionId = null;
+  // Clear the UI
+  const systemMsg = chatMessages.querySelector('.msg-system');
+  chatMessages.innerHTML = '';
+  if (systemMsg) chatMessages.appendChild(systemMsg);
+});
+
+// ── Tree polling ───────────────────────────────────────────────
+// Poll frequently while any file is in 'vectorizing' state,
+// then slow down once everything is settled.
+
+async function maybeFastPoll() {
+  await fetchTree();
+  const needsPolling = lastTreeData.some(f => f.status === 'vectorizing');
+  if (needsPolling) {
+    if (!treePoller) {
+      treePoller = setInterval(async () => {
+        await fetchTree();
+        const still = lastTreeData.some(f => f.status === 'vectorizing');
+        if (!still) {
+          clearInterval(treePoller);
+          treePoller = null;
+          // Slow background refresh every 10s
+          treePoller = setInterval(fetchTree, 10000);
+        }
+      }, TREE_POLL_MS);
+    }
+  } else {
+    if (!treePoller) {
+      treePoller = setInterval(fetchTree, 10000);
+    }
+  }
+}
+
+// ── Init ───────────────────────────────────────────────────────
+maybeFastPoll();
+</script>
 </body>
 </html>
