@@ -1,8 +1,9 @@
 """
 db.py -- rag.db schema owner and sqlite-vec setup.
 
-All settings are function arguments; no environment variables.
-Matches the WAL / PRAGMA / connection style of ../merv/serve.py.
+All settings are function arguments; no environment variables. Opens in WAL mode
+with synchronous=NORMAL so the frequent readers (web + CLI polling) never block the
+single writer.
 """
 
 import sqlite3
@@ -53,8 +54,8 @@ def init_db(path: str) -> sqlite3.Connection:
                    chunk.id.  Embedder identity (model name + version) is
                    stored alongside each vector so stale embeddings can be
                    detected when the model changes.
-    messages    -- chat transcript (mirrors merv's messages table); each row
-                   carries the chat session id that groups the conversation
+    messages    -- chat transcript; each row carries the chat session id that
+                   groups the conversation
     requests    -- incoming work queue; status pending -> running -> done/error
     state       -- singleton row: which model is currently active/loading
     corrections -- (question, context, corrected_answer) training examples
@@ -113,8 +114,8 @@ def init_db(path: str) -> sqlite3.Connection:
     """)
 
     # -- messages (chat transcript) ------------------------------------------
-    # Mirrors merv's messages table; adds session_id and request_id for the
-    # two correlation IDs described in the README logging section.
+    # Carries session_id and request_id -- the two correlation IDs described in
+    # the README logging section.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,8 +135,8 @@ def init_db(path: str) -> sqlite3.Connection:
     )
 
     # -- requests (work queue) -----------------------------------------------
-    # Same shape as merv's requests table; kind expands to cover RAG-specific
-    # operations (ingest, retrieve, chat).
+    # The incoming work queue; kind covers the RAG-specific operations
+    # (ingest, retrieve, chat).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,7 +156,7 @@ def init_db(path: str) -> sqlite3.Connection:
     )
 
     # -- state (singleton) ---------------------------------------------------
-    # Mirrors merv's state table; tracks which model is resident/loading.
+    # Singleton row tracking which model is resident/loading.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS state (
             id              INTEGER PRIMARY KEY CHECK (id = 1),

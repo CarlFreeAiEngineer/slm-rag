@@ -214,9 +214,9 @@ HF_WEIGHTS = {
         'approx_gb': 0.08,   # ~80 MB
     },
     'phi': {
-        # The UNCUSTOMIZED base Phi-4-mini-instruct (MIT) -- NOT merv's persona
-        # fine-tune. slm-rag starts uncustomized and fine-tunes on RAG corrections;
-        # merv's freeideas/merv-phi4mini emits <Mervin>/<Mervis> personas and is wrong here.
+        # The UNCUSTOMIZED base Phi-4-mini-instruct (MIT). slm-rag starts uncustomized
+        # and fine-tunes on its own RAG corrections, so it must NOT point at a persona
+        # fine-tune (one that injects its own voice instead of answering from context).
         'repo':      'bartowski/microsoft_Phi-4-mini-instruct-GGUF',
         'filename':  'microsoft_Phi-4-mini-instruct-Q4_K_M.gguf',
         'local':     os.path.join(BASE_DIR, 'model', 'phi4mini',
@@ -444,9 +444,9 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
 class ProxyBackend:
     """Runs llama-server as a subprocess and proxies HTTP to it.
 
-    Unlike merv's single-slot ProxyBackend, slm-rag keeps TWO backends resident
-    at once (one embed, one gen) -- each is a separate ProxyBackend that boots
-    independently and stays up for the lifetime of the server.
+    slm-rag keeps TWO backends resident at once (one embed, one gen) -- each is a
+    separate ProxyBackend that boots independently and stays up for the lifetime
+    of the server.
     """
 
     def __init__(self, name, cmd, port, ready_kind='llama'):
@@ -1364,7 +1364,7 @@ def cli_stub(base):
 
 
 ##############################################################################
-# Argument parsing -- NO argparse; manual loop mirrors merv's style
+# Argument parsing -- NO argparse; a small manual loop keeps deps to the stdlib
 ##############################################################################
 
 COMMAND_LINE_HELP = """\
