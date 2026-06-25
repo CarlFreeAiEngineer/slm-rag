@@ -100,14 +100,14 @@ model that benefits from it).
   is one portable file with no server to manage. Postgres + `pgvector` is documented as
   a fallback **only if** the corpus ever outgrows brute-force search (well past typical
   personal-document scale); it is intentionally **not** built.
-- **Phi-4-mini for generation.** Small, runs CPU-only via `llama.cpp`, and is the model
-  we already know how to fine-tune. "Uncustomized" to start -- the base instruct GGUF.
-  It needs **very little background knowledge baked in**: it is instructed to ignore what
-  it "knows" and answer **only from the retrieved document context**, so a small model is
-  enough -- comprehension and grounding matter far more than world knowledge here.
-- **nomic-embed-text v1.5 for embeddings.** Strong retrieval quality, small (~140 MB
-  GGUF), and runs through the same `llama.cpp` we already bundle -- no separate Python
-  embedding stack.
+- **Phi-4-mini for generation** *(MIT)*. Small, runs CPU-only via `llama.cpp`, and is the
+  model we already know how to fine-tune. "Uncustomized" to start -- the base instruct
+  GGUF. It needs **very little background knowledge baked in**: it is instructed to ignore
+  what it "knows" and answer **only from the retrieved document context**, so a small model
+  is enough -- comprehension and grounding matter far more than world knowledge here.
+- **nomic-embed-text v1.5 for embeddings** *(Apache 2.0)*. Strong retrieval quality, small
+  (~140 MB GGUF), and runs through the same `llama.cpp` we already bundle -- no separate
+  Python embedding stack.
 - **Reuse merv's portable runtime.** Bundled `uv` + `llama.cpp`, `run.bat`/`run.sh`,
   HF auto-download, static UI served by `serve.py`. Two tiny `llama-server` instances
   run side by side: one for Phi (chat), one for the embedder.
