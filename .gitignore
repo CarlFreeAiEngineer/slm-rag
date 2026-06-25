@@ -1,0 +1,52 @@
+# --- Secrets: never commit ---
+creds.txt
+*.env
+.env
+
+# --- Model weights & big artifacts (keep out of git; auto-downloaded from HF) ---
+*.gguf
+*.safetensors
+*.npz
+*.bin
+*.pt
+*.pth
+*.tar.gz
+*.tgz
+*.7z
+*.zip
+model/
+
+# --- Native binaries ---
+*.dll
+*.exe
+*.so
+*.dylib
+# downloaded llama.cpp build (binaries + CUDA runtime + .variant marker); ~1.2 GB
+bin/llama.cpp/
+# NOTE: the bundled uv binaries (bin/uv.exe, bin/uv.linux, bin/uv.mac) ARE committed,
+# force-added past the *.exe rule above -- they are the portable launcher.
+
+# --- Ingested corpus & vector store (per-user data) ---
+ragdocs/
+rag.db
+rag.db-wal
+rag.db-shm
+
+# --- Runtime / scratch ---
+tmp/
+logs/
+run*.log
+screenshots/
+__pycache__/
+*.pyc
+.claude/
+
+# --- OS / editor cruft ---
+.DS_Store
+._*
+Thumbs.db
+
+# partial streamed downloads
+*.part
+# per-machine weight checksum sidecars (cache for the staleness check)
+*.sha256
