@@ -269,9 +269,22 @@ SQLite/sqlite-vec store (P1) and the text-extraction/chunking module (P2).
   rebuilt -- the schema records which embedder produced each vector.
 - **Portable by construction.** Like merv, everything needed is bundled or
   auto-fetched; there is no global install step.
-- **Content moderation -- nice-to-have, not built.** A third small model could **screen
-  dropped files at ingest time and reject inappropriate content** (e.g. instructions for
-  harming people) *before* extraction/embedding, so the corpus stays clean. It would slot
-  in as a **moderation gate** beside the embed and gen gates, run CPU-only like the
-  embedder. Deferred -- noted here so the idea isn't lost; revisit after the core RAG loop
-  works.
+- **Content moderation -- nice-to-have, not built.** A third small "moderator" model
+  (CPU-only, slotting in as a **moderation gate** beside the embed and gen gates -- one
+  gate, two callers, just as the embed gate already serves both ingestion and retrieval)
+  could screen two surfaces:
+  - **Dropped files, at ingest time** -- reject inappropriate content (e.g. instructions
+    for harming people) *before* extraction/embedding, so the corpus never holds it.
+  - **Incoming chat messages** -- moderate the user's question. Run it in a **separate
+    thread, concurrently with the normal RAG answer** (two threads: one moderating, one
+    answering as usual), so moderation adds **no latency** to the common case. If the
+    moderator flags the message, **retroactively delete the message and its answer**:
+    cheap here because the transcript is just rows in `rag.db` and every client repaints
+    by reading it -- delete the rows, bump the revision, and also **drop the exchange from
+    the prompt-history window** so it can't poison later answers. The verdict is logged
+    under the same request / chat-session id.
+
+  This is **optimistic** by design (answer first, retract if flagged -- a flagged exchange
+  may be briefly visible before it's pulled); a stricter variant would **block** the
+  answer until the moderator clears, trading latency for never showing flagged content.
+  Deferred -- noted here so the idea isn't lost; revisit after the core RAG loop works.
