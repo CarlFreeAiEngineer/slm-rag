@@ -9,21 +9,40 @@
 # ]
 # ///
 """
-slm-rag serve.py -- P5: retrieval (question -> chunks).
+slm-rag serve.py -- P6: grounded answer + citations.
 
-Extends P4 to add the retrieve endpoint:
+Extends P5 to add the full chat flow:
 
-  - POST /retrieve {"question": "...", "scope": "<optional path>", "k": <optional int>}:
-    embed the question (embed gate, 'search_query: ' prefix for nomic v1.5) ->
-    sqlite-vec k-NN -> return top-k chunks with full citation metadata.
-    Optional 'scope' restricts results to a specific file or folder prefix.
+  - POST /enqueue {"kind":"chat","content":"<question>","session_id":"<optional>"}:
+    creates a requests row (kind=chat) and a messages row for the user turn;
+    mints a session_id if none given; returns {request_id, session_id} immediately.
 
+  - A single worker thread drains pending chat requests in order (generation is
+    serialized by the gen gate so exactly one answer is produced at a time):
+      1. Embed the question (embed gate, 'search_query: ' prefix) and retrieve
+         top-k chunks.
+      2. Build a grounded prompt from SYSTEM_PROMPT + retrieved context +
+         recent conversation history.
+      3. Insert an assistant messages row with status='streaming', stream Phi's
+         tokens into that row, then mark it done.
+      4. Log the chain: embed_request/embed_response and gen_request/gen_response
+         lines, all carrying the request id and session id.
+
+  - GET /request?id=<rid>: return {status, error} so the client can poll.
+
+  - GET /history?session_id=<sid>: return the ordered conversation messages.
+
+P5 endpoints retained: POST /retrieve.
 P4 endpoints retained: POST /ingest, GET /tree, GET /doc.
 P3 endpoints retained: POST /embed, POST /generate, GET /health.
 
 EMBEDDING NOTE: nomic-embed-text v1.5 uses task prefixes.  Document chunks are
 prefixed with 'search_document: ' before embedding.  Retrieval MUST use
 'search_query: ' for the question vector so they live in the same embedding space.
+
+PROMPT NOTE: SYSTEM_PROMPT and build_prompt() below define the exact shape sent
+to Phi at inference.  training/finetune_phi_rag.ipynb MUST mirror these exactly
+so training reinforces the same grounded, cited behaviour the server expects.
 
 Port default: 51548 (the only port-selection mechanism; no env vars).
 Model ports: 52851 (Phi/gen), 52852 (embedder).
@@ -80,6 +99,87 @@ _db_lock = threading.Lock()   # serialises multi-step transactions from differen
 
 # Default db path (can be overridden with --db flag; no env var)
 DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
+
+
+##############################################################################
+# P6 -- Grounded prompt constants
+#
+# SYSTEM_PROMPT and build_prompt() define the exact chat template sent to Phi
+# at inference time.  training/finetune_phi_rag.ipynb MUST mirror these exactly:
+# fine-tuning and serving share the same template so the model reinforces the
+# grounded, cited behaviour that the server expects here.
+#
+# Citation format: [Source: <path>, chunk <n>]
+# Each context chunk is labelled with that header before being passed to the
+# model, and the model is instructed to reproduce those labels in its answer.
+# The "I don't know" phrase is fixed so tests can match it reliably.
+##############################################################################
+
+SYSTEM_PROMPT = (
+    "You are a precise document-grounded assistant. "
+    "Answer the user's question using ONLY the information in the provided context. "
+    "For every claim you make, cite the source using the format: "
+    "[Source: <filename>, chunk <n>]. "
+    "If the answer is not present in the context, reply with exactly: "
+    "\"I don't know based on the provided documents.\""
+    " Do not use any prior knowledge outside the supplied context."
+)
+
+# Number of recent conversation turns to include in the prompt for multi-turn
+# context.  Each turn is one user message + one assistant message.  Capped to
+# avoid overflowing Phi's 4096-token context when chunks are large.
+PROMPT_TURNS = 3
+
+# Default number of chunks to retrieve for each chat question.
+CHAT_TOP_K = 5
+
+
+def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
+    """Assemble the user-turn content that is sent to Phi alongside SYSTEM_PROMPT.
+
+    The context section contains each retrieved chunk labelled with its
+    [Source: <path>, chunk <n>] header so the model can reproduce those labels
+    in its answer.  The last PROMPT_TURNS of prior conversation are prepended
+    as plain Human/Assistant turns so multi-turn dialogue works.
+
+    Parameters
+    ----------
+    question : the current user question (bare text)
+    hits     : list of chunk dicts returned by knn_chunks_with_score / get_chunk_by_id;
+               each must have keys 'path', 'chunk_index', and 'text'
+    history  : recent messages from get_messages() (excluding the current user turn);
+               only the last PROMPT_TURNS * 2 rows are used
+
+    Returns
+    -------
+    The string to use as the 'user' role content in the chat completion request.
+    """
+    # Build context section: each chunk gets a [Source: …] header so the model
+    # knows exactly which label to repeat when it cites that chunk.
+    context_parts = []
+    for hit in hits:
+        header = f"[Source: {hit['path']}, chunk {hit['chunk_index']}]"
+        context_parts.append(f"{header}\n{hit['text']}")
+    context_block = '\n\n'.join(context_parts) if context_parts else '(no context retrieved)'
+
+    # Include recent conversation history so the model can answer follow-up
+    # questions that refer back to earlier turns.  We limit to the last
+    # PROMPT_TURNS * 2 message rows (one user + one assistant per turn).
+    history_block = ''
+    recent = [m for m in history if m['role'] in ('user', 'assistant')]
+    recent = recent[-(PROMPT_TURNS * 2):]
+    if recent:
+        lines = []
+        for m in recent:
+            prefix = 'Human' if m['role'] == 'user' else 'Assistant'
+            lines.append(f"{prefix}: {m['content']}")
+        history_block = '\n'.join(lines) + '\n\n'
+
+    return (
+        f"{history_block}"
+        f"Context:\n{context_block}\n\n"
+        f"Question: {question}"
+    )
 
 
 ##############################################################################
@@ -432,6 +532,167 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
 
 
 ##############################################################################
+# P6 -- Chat worker thread
+#
+# A single daemon thread drains pending 'chat' requests from the requests
+# table one at a time.  Serializing on a single thread (rather than one thread
+# per request) means the gen gate is never contended by two concurrent chat
+# workers, which would make one of them wait anyway -- single-threading is both
+# simpler and equally fast.
+#
+# Flow for each chat request:
+#   1. Embed the question (embed gate, 'search_query: ' prefix).
+#   2. k-NN retrieval (no gate -- pure SQLite).
+#   3. Build grounded prompt (SYSTEM_PROMPT + context + history).
+#   4. Insert streaming assistant message row.
+#   5. Generate (gen gate) -- non-streaming because we update the DB row when
+#      generation finishes (no partial tokens from the llama-server HTTP path).
+#   6. Update message row: content=reply, status='done', n_tokens, gen_ms.
+#   7. Log embed_request/embed_response + gen_request/gen_response with both
+#      the request id and the session id so they can be grepped together.
+##############################################################################
+
+# Signal the worker to stop when the server is shutting down.
+_worker_stop = threading.Event()
+
+
+def _chat_worker():
+    """Daemon thread: drain pending chat requests, one at a time."""
+    while not _worker_stop.is_set():
+        # Pause briefly when the DB or backends are not yet ready.
+        if _db_conn is None or _embed_backend is None or _gen_backend is None:
+            time.sleep(1.0)
+            continue
+
+        # Peek at the next pending chat request under the lock.
+        with _db_lock:
+            req = _db_mod.next_pending_request(_db_conn)
+
+        if req is None:
+            # Nothing to do; sleep and try again.
+            time.sleep(0.5)
+            continue
+
+        # Mark the request running so it won't be picked up twice.
+        with _db_lock:
+            _db_mod.mark_request(_db_conn, req['id'], 'running')
+
+        request_id = req['request_id']
+        session_id = req['session_id']
+        ip         = '127.0.0.1'   # worker-internal; no real client IP
+
+        try:
+            content_obj = json.loads(req['content'])
+        except (json.JSONDecodeError, TypeError):
+            content_obj = {}
+        question = content_obj.get('question', '')
+
+        print(f'[worker] processing request_id={request_id} '
+              f'session_id={session_id} question={question[:80]!r}', flush=True)
+
+        try:
+            # ── Step 1: embed the question (embed gate) ───────────────────────
+            prefixed = 'search_query: ' + question
+            log_event('embed_request', ip, 'WORKER', '/enqueue',
+                      request_id=request_id, chat_session_id=session_id,
+                      request_body=prefixed[:200])
+            embed_t0 = time.time()
+            with embed_gate:
+                query_vec = _embed_backend.embed(prefixed)
+            embed_ms = int((time.time() - embed_t0) * 1000)
+            log_event('embed_response', ip, 'WORKER', '/enqueue',
+                      request_id=request_id, chat_session_id=session_id,
+                      status=200, dims=len(query_vec), latency_ms=embed_ms)
+
+            # ── Step 2: k-NN retrieval (no gate -- pure SQLite) ───────────────
+            with _db_lock:
+                hits_raw = _db_mod.knn_chunks_with_score(
+                    _db_conn, query_vec, k=CHAT_TOP_K
+                )
+                hits = []
+                for chunk_id, distance in hits_raw:
+                    meta = _db_mod.get_chunk_by_id(_db_conn, chunk_id)
+                    if meta is not None:
+                        meta['distance'] = distance
+                        hits.append(meta)
+
+            # ── Step 3: build grounded prompt ─────────────────────────────────
+            with _db_lock:
+                history = _db_mod.get_messages(_db_conn, session_id)
+            # Exclude the current user turn (last row) from history so the model
+            # does not see a duplicate of the question in the history block.
+            prior_history = [m for m in history if m['role'] != 'user' or
+                             m['content'] != question]
+            user_content = build_prompt(question, hits, prior_history)
+
+            # ── Step 4: insert streaming assistant message row ────────────────
+            with _db_lock:
+                msg_id = _db_mod.insert_message(
+                    _db_conn,
+                    session_id=session_id,
+                    role='assistant',
+                    content='',
+                    request_id=request_id,
+                    status='streaming',
+                )
+
+            # ── Step 5: generate (gen gate) ───────────────────────────────────
+            context_preview = user_content[:500]
+            log_event('gen_request', ip, 'WORKER', '/enqueue',
+                      request_id=request_id, chat_session_id=session_id,
+                      request_body=json.dumps({
+                          'system':  SYSTEM_PROMPT[:200],
+                          'user':    context_preview,
+                          'n_hits':  len(hits),
+                      }))
+            gen_t0 = time.time()
+            infer_enter()
+            try:
+                with gen_gate:
+                    reply, n_tokens = _gen_backend.generate_grounded(
+                        SYSTEM_PROMPT, user_content, max_tokens=512
+                    )
+            finally:
+                infer_exit()
+            gen_ms = int((time.time() - gen_t0) * 1000)
+
+            log_event('gen_response', ip, 'WORKER', '/enqueue',
+                      request_id=request_id, chat_session_id=session_id,
+                      status=200, n_tokens=n_tokens, latency_ms=gen_ms,
+                      response_body=reply[:500] if reply else '')
+
+            # ── Step 6: update message row to done ────────────────────────────
+            with _db_lock:
+                _db_mod.update_message(
+                    _db_conn, msg_id, reply,
+                    status='done', n_tokens=n_tokens, gen_ms=gen_ms
+                )
+                _db_mod.mark_request(_db_conn, req['id'], 'done')
+
+            print(f'[worker] done request_id={request_id} '
+                  f'n_tokens={n_tokens} gen_ms={gen_ms}', flush=True)
+
+        except Exception as exc:
+            err = str(exc)[:1000]
+            print(f'[worker] ERROR request_id={request_id}: {err}', flush=True)
+            try:
+                with _db_lock:
+                    # Update the streaming message row to error status if it was
+                    # already created before the exception.  msg_id is only
+                    # defined if Step 4 completed, so use locals() to check.
+                    _mid = locals().get('msg_id')
+                    if _mid is not None:
+                        _db_mod.update_message(
+                            _db_conn, _mid,
+                            f'[Error: {err}]',
+                            status='error',
+                        )
+                    _db_mod.mark_request(_db_conn, req['id'], 'error', error=err)
+            except Exception:
+                pass
+
+
+##############################################################################
 # Backend: ProxyBackend -- wraps a llama-server subprocess
 ##############################################################################
 
@@ -581,6 +842,46 @@ class ProxyBackend:
         finally:
             conn.close()
 
+    def generate_grounded(self, system_prompt, user_content,
+                          max_tokens=512, temperature=0.1, top_p=0.9):
+        """POST /v1/chat/completions with an explicit system + user message pair.
+
+        Uses a lower temperature (0.1) than the debug /generate endpoint because
+        grounded RAG answers benefit from determinism: the model must cite exactly
+        the source labels it was given, and temperature=0.1 keeps it on-script
+        while still allowing natural phrasing variation.
+
+        Returns (reply_text, n_tokens) where n_tokens is the completion token
+        count reported by the backend (or 0 if the field is absent).
+        """
+        payload = json.dumps({
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user',   'content': user_content},
+            ],
+            'max_tokens':  max_tokens,
+            'temperature': temperature,
+            'top_p':       top_p,
+            'stream':      False,
+        }).encode()
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=300)
+        try:
+            conn.request('POST', '/v1/chat/completions', payload,
+                         headers={'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(f'gen HTTP {resp.status}: '
+                                   f'{data.decode("utf-8","replace")[:200]}')
+            obj  = json.loads(data)
+            msg  = obj['choices'][0]['message']
+            text = (msg.get('content') or msg.get('reasoning') or
+                    msg.get('reasoning_content') or '')
+            n_tokens = obj.get('usage', {}).get('completion_tokens', 0) or 0
+            return text, n_tokens
+        finally:
+            conn.close()
+
 
 ##############################################################################
 # In-process backend (Linux only -- llama-cpp-python)
@@ -647,6 +948,23 @@ class InProcGenBackend:
             stream=False,
         )
         return result['choices'][0]['message'].get('content', '')
+
+    def generate_grounded(self, system_prompt, user_content,
+                          max_tokens=512, temperature=0.1, top_p=0.9):
+        """In-process equivalent of ProxyBackend.generate_grounded."""
+        result = InProcGenBackend._llm.create_chat_completion(
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user',   'content': user_content},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=False,
+        )
+        text     = result['choices'][0]['message'].get('content', '')
+        n_tokens = result.get('usage', {}).get('completion_tokens', 0) or 0
+        return text, n_tokens
 
     def stop(self):
         InProcGenBackend._llm = None
@@ -843,6 +1161,8 @@ def begin_shutdown(server):
         _shutdown_started = True
 
     def _worker():
+        print('[serve] shutdown: stopping worker thread ...', flush=True)
+        _worker_stop.set()
         print('[serve] shutdown: stopping backends ...', flush=True)
         stop_backends()
         print('[serve] shutdown: draining HTTP server ...', flush=True)
@@ -899,6 +1219,10 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_tree(request_id)
         elif path == '/doc':
             self._handle_doc(query, request_id)
+        elif path == '/request':
+            self._handle_request_status(query, request_id)
+        elif path == '/history':
+            self._handle_history(query, request_id)
         elif path == '/':
             self.path = '/index.html'
             super().do_GET()
@@ -928,6 +1252,8 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_ingest(body, request_id)
         elif path == '/retrieve':
             self._handle_retrieve(body, request_id)
+        elif path == '/enqueue':
+            self._handle_enqueue(body, request_id)
         else:
             self._json_response({'error': 'Not found'}, 404, request_id=request_id)
 
@@ -1434,6 +1760,138 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         self._json_response(response_payload, 200, request_id=request_id)
 
+    # ── P6 endpoints ──────────────────────────────────────────────────────────
+
+    def _handle_enqueue(self, body: bytes, request_id: str):
+        """POST /enqueue {"kind":"chat","content":"<question>","session_id":"<opt>"}
+
+        Creates a requests row (status=pending) and a user messages row, mints
+        a session_id if none was provided, and returns {request_id, session_id}
+        immediately -- the actual answer is produced asynchronously by the
+        chat worker thread.
+        """
+        ip = self.client_address[0]
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, AttributeError):
+            self._json_response({'error': 'Invalid JSON body'}, 400,
+                                request_id=request_id)
+            return
+
+        kind    = req.get('kind', 'chat')
+        content = req.get('content', '').strip()
+        sid     = req.get('session_id') or str(uuid.uuid4())
+
+        if kind != 'chat':
+            self._json_response({'error': '"kind" must be "chat"'}, 400,
+                                request_id=request_id)
+            return
+        if not content:
+            self._json_response({'error': '"content" must be a non-empty string'},
+                                400, request_id=request_id)
+            return
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        # Persist the user turn to the transcript and queue the request.
+        payload_json = json.dumps({'question': content})
+        try:
+            with _db_lock:
+                # User message first so history is correct when the worker runs.
+                _db_mod.insert_message(
+                    _db_conn,
+                    session_id=sid,
+                    role='user',
+                    content=content,
+                    request_id=request_id,
+                    status='done',
+                )
+                _db_mod.insert_request(
+                    _db_conn,
+                    kind=kind,
+                    content=payload_json,
+                    request_id=request_id,
+                    session_id=sid,
+                )
+        except Exception as e:
+            self._json_response({'error': f'DB insert failed: {e}'}, 500,
+                                request_id=request_id)
+            return
+
+        log_event('enqueue', ip, 'POST', '/enqueue',
+                  request_id=request_id, chat_session_id=sid,
+                  request_body=content[:200])
+
+        self._json_response(
+            {'request_id': request_id, 'session_id': sid},
+            200,
+            request_id=request_id,
+        )
+
+    def _handle_request_status(self, query: str, request_id: str):
+        """GET /request?id=<rid> -- return {status, error} for a request UUID."""
+        ip = self.client_address[0]
+
+        params = parse_qs(query or '')
+        rid_list = params.get('id', [])
+        if not rid_list:
+            self._json_response({'error': 'id parameter required'}, 400,
+                                request_id=request_id)
+            return
+        rid = rid_list[0]
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        try:
+            with _db_lock:
+                row = _db_mod.get_request(_db_conn, rid)
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        if row is None:
+            self._json_response({'error': f'request not found: {rid!r}'}, 404,
+                                request_id=request_id)
+            return
+
+        self._json_response(
+            {'status': row['status'], 'error': row['error']},
+            200,
+            request_id=request_id,
+        )
+
+    def _handle_history(self, query: str, request_id: str):
+        """GET /history?session_id=<sid> -- return ordered conversation messages."""
+        ip = self.client_address[0]
+
+        params = parse_qs(query or '')
+        sid_list = params.get('session_id', [])
+        if not sid_list:
+            self._json_response({'error': 'session_id parameter required'}, 400,
+                                request_id=request_id)
+            return
+        sid = sid_list[0]
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        try:
+            with _db_lock:
+                msgs = _db_mod.get_messages(_db_conn, sid)
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        self._json_response({'messages': msgs}, 200, request_id=request_id)
+
     def _handle_shutdown(self, method, query, request_id):
         """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
         ip = self.client_address[0]
@@ -1609,6 +2067,15 @@ def main():
     build_backends()
     boot_backends()
 
+    # ── start the chat worker thread (P6) ─────────────────────────────────────
+    # The worker drains pending 'chat' requests one at a time, serializing
+    # generation through the gen gate without blocking the HTTP server.
+    _worker_stop.clear()
+    worker_thread = threading.Thread(target=_chat_worker, daemon=True,
+                                     name='chat-worker')
+    worker_thread.start()
+    print('[serve] chat worker started', flush=True)
+
     # ── start the HTTP server ─────────────────────────────────────────────────
     try:
         server = ThreadedHTTPServer((HOST, port), RagHandler)
@@ -1632,7 +2099,7 @@ def main():
     server_thread.start()
     print(f'[serve] listening on http://{HOST}:{port}', flush=True)
     log_event('startup', '127.0.0.1', 'START', '/',
-              port=port, version='p5-retrieve', db_path=db_path)
+              port=port, version='p6-answer', db_path=db_path)
 
     if args['mode'] == 'cli':
         cli_stub(f'http://{HOST}:{port}')

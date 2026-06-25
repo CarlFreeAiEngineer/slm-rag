@@ -360,6 +360,150 @@ def knn_chunks_with_score(
     return [(row[0], row[1]) for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# Message helpers (P6 -- chat transcript)
+# ---------------------------------------------------------------------------
+
+def insert_message(
+    conn: sqlite3.Connection,
+    session_id: str,
+    role: str,
+    content: str,
+    request_id: str | None = None,
+    status: str = 'done',
+    n_tokens: int | None = None,
+    gen_ms: int | None = None,
+) -> int:
+    """Insert one chat message row.  Returns the new message id.
+
+    Parameters
+    ----------
+    session_id : conversation grouping key
+    role       : 'user' | 'assistant'
+    content    : message text (may be partial for streaming rows)
+    request_id : ties this message to a requests row (optional)
+    status     : 'streaming' | 'done' | 'error'
+    n_tokens   : token count (filled when generation finishes)
+    gen_ms     : wall-clock ms for generation (filled when generation finishes)
+    """
+    ts = _now()
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, request_id, role, content, ts, status, "
+        "n_tokens, gen_ms) VALUES(?,?,?,?,?,?,?,?)",
+        (session_id, request_id, role, content, ts, status, n_tokens, gen_ms),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_message(
+    conn: sqlite3.Connection,
+    message_id: int,
+    content: str,
+    status: str = 'done',
+    n_tokens: int | None = None,
+    gen_ms: int | None = None,
+) -> None:
+    """Update a message row in place (used to grow streaming content and
+    mark it done when generation completes)."""
+    conn.execute(
+        "UPDATE messages SET content=?, status=?, n_tokens=?, gen_ms=? WHERE id=?",
+        (content, status, n_tokens, gen_ms, message_id),
+    )
+    conn.commit()
+
+
+def get_messages(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[dict]:
+    """Return all messages for *session_id* ordered by insertion time (id ASC).
+
+    Each element is a dict with keys: id, session_id, request_id, role, content,
+    ts, status, n_tokens, gen_ms.
+    """
+    rows = conn.execute(
+        "SELECT id, session_id, request_id, role, content, ts, status, "
+        "n_tokens, gen_ms FROM messages WHERE session_id=? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    keys = ('id', 'session_id', 'request_id', 'role', 'content',
+            'ts', 'status', 'n_tokens', 'gen_ms')
+    return [dict(zip(keys, row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Request queue helpers (P6 -- work queue)
+# ---------------------------------------------------------------------------
+
+def insert_request(
+    conn: sqlite3.Connection,
+    kind: str,
+    content: str,
+    request_id: str,
+    session_id: str,
+) -> int:
+    """Insert a new pending request into the work queue.  Returns the row id."""
+    ts = _now()
+    cur = conn.execute(
+        "INSERT INTO requests(kind, content, request_id, session_id, status, "
+        "created_ts) VALUES(?,?,?,?,?,?)",
+        (kind, content, request_id, session_id, 'pending', ts),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def mark_request(
+    conn: sqlite3.Connection,
+    row_id: int,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Transition a request row to *status* ('running'|'done'|'error')."""
+    ts = _now() if status in ('done', 'error') else None
+    conn.execute(
+        "UPDATE requests SET status=?, error=?, done_ts=? WHERE id=?",
+        (status, error, ts, row_id),
+    )
+    conn.commit()
+
+
+def get_request(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> dict | None:
+    """Fetch a single request by its UUID request_id string.
+
+    Returns a dict with keys: id, kind, content, request_id, session_id,
+    status, error, created_ts, done_ts.  Returns None if not found.
+    """
+    row = conn.execute(
+        "SELECT id, kind, content, request_id, session_id, status, error, "
+        "created_ts, done_ts FROM requests WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    keys = ('id', 'kind', 'content', 'request_id', 'session_id',
+            'status', 'error', 'created_ts', 'done_ts')
+    return dict(zip(keys, row))
+
+
+def next_pending_request(conn: sqlite3.Connection) -> dict | None:
+    """Return the oldest pending chat request, or None if the queue is empty."""
+    row = conn.execute(
+        "SELECT id, kind, content, request_id, session_id, status, error, "
+        "created_ts, done_ts FROM requests "
+        "WHERE status='pending' AND kind='chat' ORDER BY id LIMIT 1",
+    ).fetchone()
+    if row is None:
+        return None
+    keys = ('id', 'kind', 'content', 'request_id', 'session_id',
+            'status', 'error', 'created_ts', 'done_ts')
+    return dict(zip(keys, row))
+
+
 def get_chunk_by_id(
     conn: sqlite3.Connection,
     chunk_id: int,
