@@ -154,9 +154,12 @@ def test_server_boots_and_health(port):
             lines.append(raw.decode('utf-8', 'replace').rstrip())
     threading.Thread(target=_drain, daemon=True).start()
 
-    ok, data = wait_health(port, timeout=30)
+    # serve.py loads BOTH models at startup (and Phi may be CPU-only when the GPU
+    # is full), so /health does not flip to ok until both backends are warm. Allow
+    # ample time for a cold model load, not the skeleton-era 30s.
+    ok, data = wait_health(port, timeout=300)
     if not ok:
-        print(f'  FAIL: /health did not return status ok within 30s')
+        print(f'  FAIL: /health did not return status ok within 300s')
         print(f'        server output: {lines}')
         return False
     print(f'  PASS: /health -> {data}')

@@ -254,10 +254,19 @@ slm-rag/
 
 ## Status
 
-Design stage -- this README is the spec. The build is broken into independently
-testable phases in **[PLAN.md](PLAN.md)** (each phase ends with a `curl`/CLI acceptance
-test). First slice: the `serve.py` skeleton + lifecycle (P0) and, in parallel, the
-SQLite/sqlite-vec store (P1) and the text-extraction/chunking module (P2).
+The build follows the independently testable phases in **[PLAN.md](PLAN.md)** (each
+ends with a `curl`/CLI acceptance test). **The core app works end to end today:**
+
+- **Done & green:** P0 lifecycle, P1 SQLite/sqlite-vec store, P2 extraction+chunking,
+  P3 two backends + two gates, P4 ingestion, P5 retrieval, P6 grounded cited answers,
+  P7 `--cli` chat, P8 two-panel web UI. The fine-tune notebook (P10) is drafted and
+  smoke-tested. Launch with `run.bat` / `./run.sh`, then open <http://localhost:51548>.
+- **Remaining:** P9 (capture corrections from the *"this is wrong -> fix it"* control
+  into SQLite + CSV) and P11 (staleness check that auto-pulls a re-fine-tuned model).
+- **Training is gated on real use.** There is no training data until you ingest your own
+  documents, ask real questions, and flag corrections -- so the actual fine-tune (P10)
+  is meant to be run *after* corrections accumulate, not before. The app is fully usable
+  for grounded Q&A in the meantime; the self-improvement loop is the payoff of using it.
 
 ## Notes
 

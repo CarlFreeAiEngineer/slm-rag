@@ -752,6 +752,30 @@ class ProxyBackend:
             time.sleep(2)
         raise TimeoutError(f'{self.name} not ready in {timeout}s')
 
+    def _warmup(self):
+        """Run one real inference so the first user request isn't a cold start.
+
+        A healthy /health can precede the model being able to actually serve: the
+        embedder's first /v1/embeddings call is the cold one, and under load it can
+        otherwise blow past the request timeout and fail a user's first question.
+        We warm only the embedder here -- the generator warms on its first answer
+        and its generate timeout is generous. Retries patiently over a deadline."""
+        if self.name != 'embedder':
+            return
+        deadline = time.time() + 180
+        last_err = None
+        while time.time() < deadline:
+            try:
+                vec = self.embed('warmup', timeout=120)
+                if vec:
+                    print(f'[serve] {self.name} warmup ok ({len(vec)} dims)', flush=True)
+                    return
+                last_err = 'empty vector'
+            except Exception as e:
+                last_err = e
+            time.sleep(2)
+        raise TimeoutError(f'{self.name} warmup failed: {last_err}')
+
     def _boot_once(self):
         ngl   = self._gpu_layers()
         where = f'GPU (ngl={ngl})' if ngl != '0' else 'CPU (ngl=0)'
@@ -760,6 +784,7 @@ class ProxyBackend:
             self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             self._wait_ready()
+            self._warmup()   # prove real inference works (and warm the model) before "ready"
             print(f'[serve] {self.name} ready on port {self.port} [{where}]', flush=True)
             return True
         except Exception as e:
@@ -796,11 +821,11 @@ class ProxyBackend:
 
     # ── Embedding (embedder backend only) ────────────────────────────────────
 
-    def embed(self, text):
+    def embed(self, text, timeout=60):
         """POST /v1/embeddings to llama-server; return list of floats.
         llama-server --embedding exposes the OpenAI-compatible embeddings endpoint."""
         payload = json.dumps({'input': text, 'model': 'nomic-embed'}).encode()
-        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=60)
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)
         try:
             conn.request('POST', '/v1/embeddings', payload,
                          headers={'Content-Type': 'application/json'})
