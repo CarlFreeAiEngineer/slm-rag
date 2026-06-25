@@ -504,6 +504,25 @@ def next_pending_request(conn: sqlite3.Connection) -> dict | None:
     return dict(zip(keys, row))
 
 
+# ---------------------------------------------------------------------------
+# Session helpers (P7 -- CLI clear)
+# ---------------------------------------------------------------------------
+
+def clear_session(conn: sqlite3.Connection, session_id: str) -> int:
+    """Delete all messages belonging to *session_id*.
+
+    Returns the number of rows deleted.  Leaves the requests rows in place
+    (they are an audit trail) but removes the transcript so the next turn
+    starts with a clean context window.
+    """
+    cur = conn.execute(
+        "DELETE FROM messages WHERE session_id=?",
+        (session_id,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def get_chunk_by_id(
     conn: sqlite3.Connection,
     chunk_id: int,

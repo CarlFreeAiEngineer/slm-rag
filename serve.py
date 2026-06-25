@@ -1254,6 +1254,8 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_retrieve(body, request_id)
         elif path == '/enqueue':
             self._handle_enqueue(body, request_id)
+        elif path == '/clear':
+            self._handle_clear(body, request_id)
         else:
             self._json_response({'error': 'Not found'}, 404, request_id=request_id)
 
@@ -1892,6 +1894,47 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         self._json_response({'messages': msgs}, 200, request_id=request_id)
 
+    def _handle_clear(self, body: bytes, request_id: str):
+        """POST /clear {"session_id": "..."}
+
+        Deletes all messages for the given session so that the next question
+        starts from a blank context window.  Used by the CLI /clear command
+        and (later) by the web UI clear button.
+
+        Returns {ok: true, deleted: <n>} on success.
+        """
+        ip = self.client_address[0]
+        try:
+            req = json.loads(body) if body else {}
+        except (json.JSONDecodeError, AttributeError):
+            self._json_response({'error': 'Invalid JSON body'}, 400,
+                                request_id=request_id)
+            return
+
+        sid = req.get('session_id', '').strip()
+        if not sid:
+            self._json_response({'error': '"session_id" required'}, 400,
+                                request_id=request_id)
+            return
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        try:
+            with _db_lock:
+                deleted = _db_mod.clear_session(_db_conn, sid)
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        log_event('clear_session', ip, 'POST', '/clear',
+                  request_id=request_id, chat_session_id=sid,
+                  deleted=deleted)
+        self._json_response({'ok': True, 'deleted': deleted}, 200,
+                            request_id=request_id)
+
     def _handle_shutdown(self, method, query, request_id):
         """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
         ip = self.client_address[0]
@@ -1953,12 +1996,196 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 ##############################################################################
-# CLI stub -- will be fleshed out in P7
+# CLI REPL -- P7
+#
+# A thin HTTP client of the same running server (http://127.0.0.1:<port>).
+# The terminal and the browser share one transcript and go through the same
+# two gates (embed + gen), so no second inference path exists.
+#
+# Commands
+# --------
+#   /clear   -- delete this session's transcript (POST /clear) and start fresh
+#   /help    -- print the command list
+#   /quit    -- exit the REPL (and shut the server down)
+#   /exit    -- alias for /quit
+#   <text>   -- ask a question; polls until done; prints the answer inline
+#
+# There is no /model switch -- slm-rag serves a single model.
+#
+# Generation on this hardware can take up to ~50 s; the REPL polls patiently
+# with a "thinking..." heartbeat every 15 s and a generous timeout (10 min).
 ##############################################################################
 
-def cli_stub(base):
-    print('[serve] --cli: terminal chat not yet implemented (P7 stub).')
-    print('[serve] Web server is still running.  Press Ctrl-C to stop.')
+CLI_HELP = """\
+[cli] Commands:
+  /help   -- show this message
+  /clear  -- erase the current session transcript (web UI sees it too)
+  /quit   -- exit (also /exit)
+  <text>  -- ask a question; citations are printed inline with the answer
+
+There is no /model switch -- slm-rag serves one model."""
+
+CLI_POLL_INTERVAL_S = 3.0
+CLI_ANSWER_TIMEOUT_S = 10 * 60   # 10 min; generation can take ~50 s on GPU
+CLI_HEARTBEAT_EVERY  = 15.0
+
+
+def _cli_http_get(base_url, path_qs, timeout=10):
+    """GET base_url+path_qs; return (status_code, parsed_json_or_None)."""
+    try:
+        with urlopen(base_url + path_qs, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except Exception as e:
+        return None, {'error': str(e)}
+
+
+def _cli_http_post(base_url, path, payload, timeout=30):
+    """POST JSON payload to base_url+path; return (status_code, parsed_json_or_None)."""
+    from urllib.error import HTTPError
+    data = json.dumps(payload).encode()
+    req  = Request(
+        base_url + path,
+        data=data,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        return None, {'error': str(e)}
+
+
+def cli_repl(base_url):
+    """Interactive terminal chat loop.
+
+    Runs on the main thread after the web server thread is up.  Exits when the
+    user types /quit or /exit (or sends EOF).  Triggers a clean server shutdown
+    when it exits so Ctrl-C / /quit both clean up properly.
+    """
+    session_id = str(uuid.uuid4())
+
+    print('[cli] Terminal chat ready.  Type /help for commands.', flush=True)
+    print(f'[cli] Session: {session_id[:8]}...', flush=True)
+    print('[cli] (Web UI available at ' + base_url + ')', flush=True)
+
+    while True:
+        # Read one line from stdin.  EOF (piped input exhausted, or Ctrl-D)
+        # is treated the same as /quit.
+        try:
+            line = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt):
+            line = ''
+
+        if not line:
+            # EOF -- exit cleanly
+            print('\n[cli] EOF -- exiting.', flush=True)
+            break
+
+        text = line.rstrip('\n').rstrip('\r')
+
+        # ── Built-in commands ─────────────────────────────────────────────────
+        if text.strip() == '/help':
+            print(CLI_HELP, flush=True)
+            continue
+
+        if text.strip() in ('/quit', '/exit'):
+            print('[cli] Goodbye.', flush=True)
+            break
+
+        if text.strip() == '/clear':
+            code, resp = _cli_http_post(
+                base_url, '/clear', {'session_id': session_id}
+            )
+            if code == 200 and resp.get('ok'):
+                session_id = str(uuid.uuid4())
+                print(f'[cli] Transcript cleared.  New session: {session_id[:8]}...',
+                      flush=True)
+            else:
+                print(f'[cli] /clear failed: {resp}', flush=True)
+            continue
+
+        # ── Skip blank lines ──────────────────────────────────────────────────
+        if not text.strip():
+            continue
+
+        # ── Ask a question ────────────────────────────────────────────────────
+        question = text.strip()
+
+        # 1. Enqueue
+        enq_code, enq_resp = _cli_http_post(
+            base_url, '/enqueue',
+            {'kind': 'chat', 'content': question, 'session_id': session_id},
+        )
+        if enq_code != 200:
+            print(f'[cli] Error queuing question: {enq_resp}', flush=True)
+            continue
+
+        rid        = enq_resp.get('request_id')
+        session_id = enq_resp.get('session_id', session_id)   # server may have minted one
+
+        if not rid:
+            print('[cli] Error: server did not return a request_id', flush=True)
+            continue
+
+        # 2. Poll until done
+        print('[cli] thinking...', flush=True)
+        deadline  = time.time() + CLI_ANSWER_TIMEOUT_S
+        last_hb   = time.time()
+        done_resp = None
+
+        while time.time() < deadline:
+            time.sleep(CLI_POLL_INTERVAL_S)
+            poll_code, poll_resp = _cli_http_get(
+                base_url, f'/request?id={rid}'
+            )
+            if poll_code == 200:
+                status = poll_resp.get('status', '')
+                if status in ('done', 'error'):
+                    done_resp = poll_resp
+                    break
+            # Heartbeat so the user knows the CLI is still alive
+            now = time.time()
+            if now - last_hb >= CLI_HEARTBEAT_EVERY:
+                remaining = int(deadline - now)
+                print(f'[cli] still thinking... ({remaining}s left)', flush=True)
+                last_hb = now
+
+        if done_resp is None:
+            print(f'[cli] Timed out waiting for answer (>{CLI_ANSWER_TIMEOUT_S}s)',
+                  flush=True)
+            continue
+
+        if done_resp.get('status') == 'error':
+            print(f'[cli] Generation error: {done_resp.get("error")}', flush=True)
+            continue
+
+        # 3. Fetch history and print the latest assistant answer
+        h_code, h_resp = _cli_http_get(
+            base_url, f'/history?session_id={session_id}'
+        )
+        if h_code != 200:
+            print(f'[cli] Could not retrieve history: {h_resp}', flush=True)
+            continue
+
+        messages   = h_resp.get('messages', [])
+        asst_msgs  = [m for m in messages
+                      if m.get('role') == 'assistant' and m.get('status') == 'done']
+        if not asst_msgs:
+            print('[cli] No answer available yet.', flush=True)
+            continue
+
+        answer = asst_msgs[-1].get('content', '').strip()
+        # Print the answer with a blank line above and below for readability.
+        # Citations ([Source: <file>, chunk <n>]) are already embedded in the
+        # answer text by the grounded prompt, so they print inline here without
+        # any extra formatting -- exactly the behaviour described in the README.
+        print(f'\n{answer}\n', flush=True)
 
 
 ##############################################################################
@@ -2102,7 +2329,7 @@ def main():
               port=port, version='p6-answer', db_path=db_path)
 
     if args['mode'] == 'cli':
-        cli_stub(f'http://{HOST}:{port}')
+        cli_repl(f'http://{HOST}:{port}')
         begin_shutdown(server)
 
     # Block until server_thread finishes (i.e. server.shutdown() was called).
