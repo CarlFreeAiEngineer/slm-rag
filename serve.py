@@ -554,13 +554,14 @@ def _ingest_background(doc_id: int, rel_path: str, request_id: str):
     except Exception as exc:
         print(f'[serve] ingest ERROR: doc_id={doc_id} rel_path={rel_path!r}: {exc}',
               flush=True)
+        log_event('ingest_error', '-', 'WORKER', '/ingest',
+                  request_id=request_id, error=str(exc))
+        # A document that did not finish ingesting should not show in the tree.
+        # Remove it (and any partial chunks) entirely -- the full error is in the
+        # logs/ audit trail, so nothing is lost, but the user never sees a broken row.
         try:
             with _db_lock:
-                _db_conn.execute(
-                    "UPDATE documents SET status='error', error_msg=? WHERE id=?",
-                    (str(exc)[:1000], doc_id),
-                )
-                _db_conn.commit()
+                _db_mod.delete_document(_db_conn, rel_path)
         except Exception:
             pass
 
@@ -1061,13 +1062,19 @@ def build_backends():
             print('[serve] FATAL: llama-server not found and not Linux', flush=True)
             sys.exit(1)
 
-        # Embedder: CPU-only, --embedding flag
+        # Embedder: CPU-only, --embedding flag.
+        # ctx/batch sized to 2048: an embedding input must fit in ONE physical batch,
+        # and a ~512-token chunk + the 'search_document: ' prefix can exceed 512 (a
+        # 514-token chunk got rejected with HTTP 500 at batch 512). nomic-embed v1.5
+        # supports 2048, giving ~4x headroom over our chunk target.
         embed_cmd = [
             llama_srv,
             '--model',         embed_gguf,
             '--port',          str(EMBED_PORT),
             '--host',          '127.0.0.1',
-            '--ctx-size',      '512',
+            '--ctx-size',      '2048',
+            '--batch-size',    '2048',
+            '--ubatch-size',   '2048',
             '--n-gpu-layers',  '0',          # CPU-only: leave all VRAM for Phi
             '--threads',       str(THREADS),
             '--embedding',                   # enable embeddings endpoint
