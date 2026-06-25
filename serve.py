@@ -448,6 +448,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _embed_resilient(text, attempts=3, timeout=120):
+    """Embed with retries and a generous timeout.
+
+    The embedder is CPU-bound (the GPU is reserved for Phi), so under a load spike
+    a single embed can transiently exceed the default timeout. One blip should not
+    fail a whole ingest or a user's question, so we retry a few times before giving
+    up. Used by both the ingest worker and the chat query-embed."""
+    last = None
+    for attempt in range(attempts):
+        try:
+            return _embed_backend.embed(text, timeout=timeout)
+        except Exception as e:
+            last = e
+            print(f'[serve] embed attempt {attempt + 1}/{attempts} failed ({e}); '
+                  f'retrying ...', flush=True)
+            time.sleep(1.0)
+    raise last
+
+
 def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: str):
     """
     Background worker: extract -> chunk -> embed (in batches, yielding the embed
@@ -489,7 +508,7 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
                     # Prefix with 'search_document: ' for nomic-embed-text v1.5
                     # asymmetric retrieval.  P5 uses 'search_query: ' on the question.
                     prefixed_text = 'search_document: ' + chunk['text']
-                    vector = _embed_backend.embed(prefixed_text)
+                    vector = _embed_resilient(prefixed_text)
                     embedded_batch.append((chunk, vector))
             # embed_gate is released here -- next /embed or next batch can proceed
 
@@ -598,7 +617,7 @@ def _chat_worker():
                       request_body=prefixed[:200])
             embed_t0 = time.time()
             with embed_gate:
-                query_vec = _embed_backend.embed(prefixed)
+                query_vec = _embed_resilient(prefixed)
             embed_ms = int((time.time() - embed_t0) * 1000)
             log_event('embed_response', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
