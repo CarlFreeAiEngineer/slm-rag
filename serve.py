@@ -1163,8 +1163,21 @@ def _setup_kill_on_exit_job():
 
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
         JobObjectExtendedLimitInformation = 9
-        k32.CreateJobObjectW.restype = wintypes.HANDLE
-        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        # Declare argtypes/restype so ctypes passes HANDLEs as pointer-sized values.
+        # Without this, handle args default to 32-bit int and GetCurrentProcess()'s
+        # -1 pseudo-handle overflows ("int too long to convert").
+        HANDLE, BOOL, DWORD, LPVOID = (wintypes.HANDLE, wintypes.BOOL,
+                                       wintypes.DWORD, wintypes.LPVOID)
+        k32.CreateJobObjectW.restype = HANDLE
+        k32.CreateJobObjectW.argtypes = [LPVOID, wintypes.LPCWSTR]
+        k32.GetCurrentProcess.restype = HANDLE
+        k32.GetCurrentProcess.argtypes = []
+        k32.SetInformationJobObject.restype = BOOL
+        k32.SetInformationJobObject.argtypes = [HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p, DWORD]
+        k32.AssignProcessToJobObject.restype = BOOL
+        k32.AssignProcessToJobObject.argtypes = [HANDLE, HANDLE]
+        k32.CloseHandle.argtypes = [HANDLE]
 
         job = k32.CreateJobObjectW(None, None)
         if not job:
