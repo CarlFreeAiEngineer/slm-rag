@@ -1112,6 +1112,132 @@ def stop_backends():
 
 
 ##############################################################################
+# Orphan cleanup -- a crashed or force-killed serve.py must not leave its
+# llama-server children holding the model ports and GPU VRAM. Two guards:
+#   1. a Windows Job Object so children die with us even on a hard kill, and
+#   2. a startup reap that frees the model ports before we boot.
+# Together they make every launch start from a clean slate (last launch wins).
+##############################################################################
+
+_kill_on_exit_job = None   # keep the Windows job handle alive for our lifetime
+
+
+def _setup_kill_on_exit_job():
+    """Windows: place this process in a Job Object configured to kill all member
+    processes when the job closes (when serve.py exits -- including a crash or
+    taskkill). Child llama-server processes inherit the job, so they can never be
+    orphaned holding a model port + VRAM. Best-effort; no-op on other OSes or on
+    failure (the startup reap + SIGTERM teardown still apply)."""
+    global _kill_on_exit_job
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        class BASIC(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64),
+                        ('PerJobUserTimeLimit', ctypes.c_int64),
+                        ('LimitFlags', wintypes.DWORD),
+                        ('MinimumWorkingSetSize', ctypes.c_size_t),
+                        ('MaximumWorkingSetSize', ctypes.c_size_t),
+                        ('ActiveProcessLimit', wintypes.DWORD),
+                        ('Affinity', ctypes.c_size_t),
+                        ('PriorityClass', wintypes.DWORD),
+                        ('SchedulingClass', wintypes.DWORD)]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in
+                        ('ReadOperationCount', 'WriteOperationCount',
+                         'OtherOperationCount', 'ReadTransferCount',
+                         'WriteTransferCount', 'OtherTransferCount')]
+
+        class EXTENDED(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', BASIC),
+                        ('IoInfo', IO_COUNTERS),
+                        ('ProcessMemoryLimit', ctypes.c_size_t),
+                        ('JobMemoryLimit', ctypes.c_size_t),
+                        ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                        ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = EXTENDED()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                           ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
+            return
+        if not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+            k32.CloseHandle(job)
+            return
+        _kill_on_exit_job = job   # closes (and kills children) when the process ends
+        print('[serve] kill-on-exit guard active (llama-server children die with serve.py)',
+              flush=True)
+    except Exception as e:
+        print(f'[serve] kill-on-exit guard unavailable ({e}); '
+              f'relying on startup reap + shutdown teardown', flush=True)
+
+
+def _pids_listening_on(port):
+    """PIDs holding a LISTEN socket on `port` (best-effort, stdlib netstat/lsof)."""
+    pids = set()
+    try:
+        if os.name == 'nt':
+            out = subprocess.run(['netstat', '-ano', '-p', 'tcp'],
+                                 capture_output=True, text=True, timeout=10).stdout
+            needle = f':{port}'
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[3].upper() == 'LISTENING' \
+                        and parts[1].endswith(needle):
+                    try:
+                        pids.add(int(parts[4]))
+                    except ValueError:
+                        pass
+        else:
+            out = subprocess.run(['lsof', '-ti', f'tcp:{port}', '-sTCP:LISTEN'],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    pids.add(int(line.strip()))
+    except Exception:
+        pass
+    return pids
+
+
+def _kill_pid(pid):
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def reap_orphan_backends():
+    """Free the model ports before booting: kill whatever still listens on
+    EMBED_PORT / PHI_PORT. A serve.py that crashed or was force-killed can leave
+    its llama-server children on those ports holding GPU VRAM -- which blocks our
+    boot AND skews the free-VRAM reading that decides GPU-vs-CPU offload. Reaping
+    them means every launch starts clean (last launch wins, which is what a
+    single-user desktop app wants)."""
+    for port in (EMBED_PORT, PHI_PORT):
+        for pid in _pids_listening_on(port):
+            print(f'[serve] reaping orphan backend on port {port} (pid {pid})', flush=True)
+            _kill_pid(pid)
+
+
+##############################################################################
 # --check: planned backend layout
 ##############################################################################
 
@@ -2333,6 +2459,11 @@ def main():
 
     # ── download weights (embedder first, then Phi) ───────────────────────────
     ensure_weights()
+
+    # ── orphan guards: kill leftover backends from a prior crashed run, and
+    #    arrange for our own child llama-servers to die with us (Windows job) ───
+    _setup_kill_on_exit_job()
+    reap_orphan_backends()
 
     # ── build and boot both backends ──────────────────────────────────────────
     build_backends()
