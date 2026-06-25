@@ -9,26 +9,20 @@
 # ]
 # ///
 """
-slm-rag serve.py -- P4: ingestion pipeline (drop -> searchable).
+slm-rag serve.py -- P5: retrieval (question -> chunks).
 
-Extends P3 to wire together db.py (P1), ingest_lib.py (P2), and the embed gate
-(P3) into a full ingestion pipeline:
+Extends P4 to add the retrieve endpoint:
 
-  - POST /ingest (multipart file upload): save file under ragdocs/, insert a
-    documents row with status 'vectorizing', kick off background ingestion.
-    Background worker: ingest_lib.ingest_file -> embed each chunk through the
-    embed gate in small batches (yielding the gate between batches so an
-    interactive query can slip in) -> store chunks + vectors via db.py helpers.
-    When all chunks are stored, set status 'ready'.  On error set 'error'.
-  - GET /tree: return the ingested corpus as JSON (files/folders under ragdocs/)
-    with status and chunk count per file.
-  - GET /doc?path=<p>: return the stored text (or preview) of an ingested file.
-  - --db <path>: path to rag.db (default BASE_DIR/rag.db); no env var.
+  - POST /retrieve {"question": "...", "scope": "<optional path>", "k": <optional int>}:
+    embed the question (embed gate, 'search_query: ' prefix for nomic v1.5) ->
+    sqlite-vec k-NN -> return top-k chunks with full citation metadata.
+    Optional 'scope' restricts results to a specific file or folder prefix.
 
+P4 endpoints retained: POST /ingest, GET /tree, GET /doc.
 P3 endpoints retained: POST /embed, POST /generate, GET /health.
 
 EMBEDDING NOTE: nomic-embed-text v1.5 uses task prefixes.  Document chunks are
-prefixed with 'search_document: ' before embedding.  P5 retrieval MUST use
+prefixed with 'search_document: ' before embedding.  Retrieval MUST use
 'search_query: ' for the question vector so they live in the same embedding space.
 
 Port default: 51548 (the only port-selection mechanism; no env vars).
@@ -932,6 +926,8 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_generate(body, request_id)
         elif path == '/ingest':
             self._handle_ingest(body, request_id)
+        elif path == '/retrieve':
+            self._handle_retrieve(body, request_id)
         else:
             self._json_response({'error': 'Not found'}, 404, request_id=request_id)
 
@@ -1294,6 +1290,150 @@ class RagHandler(SimpleHTTPRequestHandler):
             'chunks':      chunks_out,
         }, 200, request_id=request_id)
 
+    def _handle_retrieve(self, body: bytes, request_id: str):
+        """POST /retrieve {"question": "...", "scope": "<optional path>", "k": <optional int>}
+
+        Embeds the question through the embed gate using the 'search_query: '
+        prefix (required by nomic-embed-text v1.5 for asymmetric retrieval --
+        document chunks were stored with 'search_document: '; these two prefixes
+        must match for the vectors to be comparable), then runs sqlite-vec k-NN
+        to return the top-k most relevant chunks.
+
+        If 'scope' is given, results are restricted to chunks whose document
+        path equals that value (exact file) or starts with it followed by '/'
+        (folder prefix).  The filtering is done by db.knn_chunks_with_score so
+        that the scope never requires a second round-trip to the embedder.
+
+        Returns JSON:
+          {
+            "hits": [
+              {
+                "path":        "<relative path under ragdocs/>",
+                "chunk_index": <int>,
+                "char_start":  <int>,
+                "char_end":    <int>,
+                "text":        "<chunk text>",
+                "distance":    <float>   // L2; lower = closer
+              },
+              ...
+            ]
+          }
+
+        This is the contract that P6 (answer) and the web UI consume.
+        """
+        ip = self.client_address[0]
+
+        # ── Parse request body ────────────────────────────────────────────────
+        try:
+            req = json.loads(body)
+        except (json.JSONDecodeError, AttributeError):
+            self._json_response({'error': 'Invalid JSON body'}, 400,
+                                request_id=request_id)
+            return
+
+        question = req.get('question', '').strip()
+        if not question:
+            self._json_response({'error': '"question" must be a non-empty string'},
+                                400, request_id=request_id)
+            return
+
+        k     = req.get('k', 5)
+        scope = req.get('scope')   # optional str; None means no scope filter
+
+        if not isinstance(k, int) or k < 1:
+            self._json_response({'error': '"k" must be a positive integer'},
+                                400, request_id=request_id)
+            return
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        # ── Log the incoming retrieve request ─────────────────────────────────
+        log_event('retrieve_request', ip, 'POST', '/retrieve',
+                  request_id=request_id,
+                  request_body=json.dumps({
+                      'question': question[:200],
+                      'scope':    scope,
+                      'k':        k,
+                  }))
+
+        t0 = time.time()
+
+        # ── Step 1: embed the question (search_query: prefix for nomic v1.5) ──
+        # nomic-embed-text v1.5 uses task prefixes for asymmetric retrieval.
+        # Documents were stored with 'search_document: '; queries MUST use
+        # 'search_query: ' so they project into the same embedding space.
+        prefixed_question = 'search_query: ' + question
+        log_event('embed_request', ip, 'POST', '/retrieve',
+                  request_id=request_id,
+                  request_body=prefixed_question[:200])
+        embed_t0 = time.time()
+        with embed_gate:
+            try:
+                query_vec = _embed_backend.embed(prefixed_question)
+            except Exception as e:
+                log_event('embed_response', ip, 'POST', '/retrieve',
+                          request_id=request_id, status=500, error=str(e))
+                self._json_response({'error': f'Embedding failed: {e}'}, 500,
+                                    request_id=request_id)
+                return
+        embed_ms = int((time.time() - embed_t0) * 1000)
+        log_event('embed_response', ip, 'POST', '/retrieve',
+                  request_id=request_id, status=200,
+                  dims=len(query_vec), latency_ms=embed_ms)
+
+        # ── Step 2: sqlite-vec k-NN (no gate -- pure SQLite, no model) ────────
+        try:
+            with _db_lock:
+                hits_raw = _db_mod.knn_chunks_with_score(
+                    _db_conn, query_vec, k=k, scope=scope
+                )
+        except Exception as e:
+            log_event('retrieve_response', ip, 'POST', '/retrieve',
+                      request_id=request_id, status=500, error=str(e))
+            self._json_response({'error': f'k-NN query failed: {e}'}, 500,
+                                request_id=request_id)
+            return
+
+        # ── Step 3: fetch citation metadata for each hit ──────────────────────
+        hits_out = []
+        try:
+            with _db_lock:
+                for chunk_id, distance in hits_raw:
+                    meta = _db_mod.get_chunk_by_id(_db_conn, chunk_id)
+                    if meta is None:
+                        continue
+                    hits_out.append({
+                        'path':        meta['path'],
+                        'chunk_index': meta['chunk_index'],
+                        'char_start':  meta['char_start'],
+                        'char_end':    meta['char_end'],
+                        'text':        meta['text'],
+                        'distance':    distance,
+                    })
+        except Exception as e:
+            log_event('retrieve_response', ip, 'POST', '/retrieve',
+                      request_id=request_id, status=500, error=str(e))
+            self._json_response({'error': f'Chunk fetch failed: {e}'}, 500,
+                                request_id=request_id)
+            return
+
+        latency_ms = int((time.time() - t0) * 1000)
+        response_payload = {'hits': hits_out}
+
+        log_event('retrieve_response', ip, 'POST', '/retrieve',
+                  request_id=request_id, status=200,
+                  n_hits=len(hits_out), scope=scope, latency_ms=latency_ms,
+                  response_body=json.dumps({
+                      'n_hits': len(hits_out),
+                      'top1_path': hits_out[0]['path'] if hits_out else None,
+                      'top1_chunk_index': hits_out[0]['chunk_index'] if hits_out else None,
+                  }))
+
+        self._json_response(response_payload, 200, request_id=request_id)
+
     def _handle_shutdown(self, method, query, request_id):
         """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
         ip = self.client_address[0]
@@ -1492,7 +1632,7 @@ def main():
     server_thread.start()
     print(f'[serve] listening on http://{HOST}:{port}', flush=True)
     log_event('startup', '127.0.0.1', 'START', '/',
-              port=port, version='p4-ingest', db_path=db_path)
+              port=port, version='p5-retrieve', db_path=db_path)
 
     if args['mode'] == 'cli':
         cli_stub(f'http://{HOST}:{port}')

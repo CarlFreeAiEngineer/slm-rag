@@ -294,3 +294,99 @@ def knn_chunks(
         ).fetchall()
 
     return [row[0] for row in rows]
+
+
+def knn_chunks_with_score(
+    conn: sqlite3.Connection,
+    query_vec: list[float],
+    k: int = 5,
+    scope: str | None = None,
+) -> list[tuple[int, float]]:
+    """Return (chunk_id, distance) pairs for the *k* nearest chunks.
+
+    Results are ordered by ascending L2 distance (closest first).
+
+    Parameters
+    ----------
+    conn       : open connection returned by connect() / init_db()
+    query_vec  : 768-dim probe vector (plain Python list of floats)
+    k          : number of nearest neighbours to return
+    scope      : optional path filter -- when given, only chunks whose
+                 document path equals *scope* (exact file match) or starts
+                 with *scope* followed by '/' (folder prefix) are returned.
+                 The comparison is done after the k-NN using a JOIN on
+                 documents.path, which is safe at personal-corpus scale.
+    """
+    qblob = _serialize(query_vec)
+
+    if scope is None:
+        rows = conn.execute(
+            """
+            SELECT cv.chunk_id, cv.distance
+            FROM chunk_vecs cv
+            WHERE cv.embedding MATCH ?
+              AND k = ?
+            ORDER BY distance
+            """,
+            (qblob, k),
+        ).fetchall()
+    else:
+        # Normalise scope to forward slashes for consistent prefix matching.
+        scope_norm = scope.replace("\\", "/").rstrip("/")
+        # Retrieve a larger candidate set so that after filtering by scope we
+        # still have up to k results.  Fetching k*10 is a conservative upper
+        # bound that covers any realistic corpus layout while remaining fast.
+        fetch_k = k * 10
+        rows = conn.execute(
+            """
+            SELECT cv.chunk_id, cv.distance
+            FROM chunk_vecs cv
+            JOIN chunks c   ON c.id  = cv.chunk_id
+            JOIN documents d ON d.id = c.doc_id
+            WHERE cv.embedding MATCH ?
+              AND k = ?
+              AND (
+                    d.path = ?
+                    OR d.path LIKE ? ESCAPE '\\'
+                  )
+            ORDER BY distance
+            """,
+            (qblob, fetch_k, scope_norm, scope_norm + "/%"),
+        ).fetchall()
+        # Trim to k after scope filter (sqlite-vec applies k before the JOIN
+        # filter, so rows may be fewer than k -- take what we have up to k).
+        rows = rows[:k]
+
+    return [(row[0], row[1]) for row in rows]
+
+
+def get_chunk_by_id(
+    conn: sqlite3.Connection,
+    chunk_id: int,
+) -> dict | None:
+    """Fetch full chunk metadata for a single chunk_id.
+
+    Returns a dict with keys: id, doc_id, chunk_index, text, char_start,
+    char_end, path (document relative path).  Returns None if not found.
+    """
+    row = conn.execute(
+        """
+        SELECT c.id, c.doc_id, c.chunk_index, c.text, c.char_start, c.char_end,
+               d.path
+        FROM chunks c
+        JOIN documents d ON d.id = c.doc_id
+        WHERE c.id = ?
+        """,
+        (chunk_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id":          row[0],
+        "doc_id":      row[1],
+        "chunk_index": row[2],
+        "text":        row[3],
+        "char_start":  row[4],
+        "char_end":    row[5],
+        "path":        row[6],
+    }
