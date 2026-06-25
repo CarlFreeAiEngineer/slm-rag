@@ -23,8 +23,11 @@ P1 store ───────────┘                          │      
 P2 chunker ────────────────────────────────────┘
 ```
 
-- Put acceptance tests in `tests/` as runnable scripts (`.ps1` / `.sh` / `pytest`), so a
-  full `tests/run-all` re-verifies every green phase after each change.
+- **Tests are plain Python scripts -- no test framework, no `pytest`.** Each lives in
+  `tests/` (e.g. `tests/p4_ingest.py`), runs with `uv run tests/p4_ingest.py`, prints
+  what it checked, and **exits `0` on pass / non-zero on fail** (raise or
+  `sys.exit(1)`). A `tests/run_all.py` runs each phase script in turn and exits non-zero
+  if any did -- that is the whole harness. CI, if any, is just `uv run tests/run_all.py`.
 
 ---
 
@@ -161,10 +164,12 @@ status, click to preview); right = chat (streamed answers, click-through citatio
 *"this is wrong -> fix it"* control). Pure client of the documented API -- **no private
 endpoints**.
 
-**Test.** Because the UI is only the API, P4-P6 curl tests already cover the behavior; a
-Playwright smoke test drives the one non-curl surface: drag a file in, watch it go
-*ready*, ask a question, see a clickable citation. This is the only phase whose
-acceptance is partly visual -- which is why we kept the UI thin.
+**Test.** Because the UI is only the API, the P4-P6 phase scripts already cover the
+behavior. For the one non-curl surface, a `tests/p8_ui.py` script drives a headless
+browser (Playwright driven from plain Python -- still just exit 0 / non-zero, no test
+framework): drag a file in, watch it go *ready*, ask a question, assert a clickable
+citation is present. This is the only phase whose acceptance is partly visual -- which is
+why we kept the UI thin.
 
 **Depends.** P4, P5, P6 (stable API).
 
