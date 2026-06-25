@@ -269,3 +269,9 @@ SQLite/sqlite-vec store (P1) and the text-extraction/chunking module (P2).
   rebuilt -- the schema records which embedder produced each vector.
 - **Portable by construction.** Like merv, everything needed is bundled or
   auto-fetched; there is no global install step.
+- **Content moderation -- nice-to-have, not built.** A third small model could **screen
+  dropped files at ingest time and reject inappropriate content** (e.g. instructions for
+  harming people) *before* extraction/embedding, so the corpus stays clean. It would slot
+  in as a **moderation gate** beside the embed and gen gates, run CPU-only like the
+  embedder. Deferred -- noted here so the idea isn't lost; revisit after the core RAG loop
+  works.

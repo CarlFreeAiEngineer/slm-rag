@@ -46,6 +46,9 @@ __pycache__/
 ._*
 Thumbs.db
 
+# test-generated PDF fixture (re-created by tests/p2_chunk.py on each run)
+samples/test_gen.pdf
+
 # partial streamed downloads
 *.part
 # per-machine weight checksum sidecars (cache for the staleness check)
