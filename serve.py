@@ -629,7 +629,7 @@ def _chat_worker():
             prefixed = 'search_query: ' + question
             log_event('embed_request', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
-                      request_body=prefixed[:200])
+                      request_body=prefixed)
             embed_t0 = time.time()
             with embed_gate:
                 query_vec = _embed_resilient(prefixed)
@@ -671,14 +671,15 @@ def _chat_worker():
                 )
 
             # ── Step 5: generate (gen gate) ───────────────────────────────────
-            context_preview = user_content[:500]
+            # Log the COMPLETE prompt sent to Phi (full system + full user content)
+            # -- accurate, untruncated records of every model prompt are required.
             log_event('gen_request', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
                       request_body=json.dumps({
-                          'system':  SYSTEM_PROMPT[:200],
-                          'user':    context_preview,
+                          'system':  SYSTEM_PROMPT,
+                          'user':    user_content,
                           'n_hits':  len(hits),
-                      }))
+                      }, ensure_ascii=False))
             gen_t0 = time.time()
             infer_enter()
             try:
@@ -693,7 +694,7 @@ def _chat_worker():
             log_event('gen_response', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
                       status=200, n_tokens=n_tokens, latency_ms=gen_ms,
-                      response_body=reply[:500] if reply else '')
+                      response_body=reply or '')
 
             # ── Step 6: update message row to done ────────────────────────────
             with _db_lock:
@@ -1439,7 +1440,8 @@ class RagHandler(SimpleHTTPRequestHandler):
         request_id = str(uuid.uuid4())
         ip = self.client_address[0]
 
-        log_event('http_request', ip, 'GET', path, request_id=request_id)
+        log_event('http_request', ip, 'GET', path, request_id=request_id,
+                  request_body=query or None)
 
         if path == '/health':
             self._handle_health(request_id)
@@ -1470,7 +1472,7 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         log_event('http_request', ip, 'POST', path,
                   request_id=request_id,
-                  request_body=body.decode('utf-8', 'replace')[:500] if body else None)
+                  request_body=body.decode('utf-8', 'replace') if body else None)
 
         if path == '/shutdown':
             self._handle_shutdown('POST', '', request_id)
@@ -1546,7 +1548,7 @@ class RagHandler(SimpleHTTPRequestHandler):
             return
 
         log_event('embed_request', ip, 'POST', '/embed', request_id=request_id,
-                  request_body=text[:200])
+                  request_body=text)
         t0 = time.time()
         with embed_gate:
             try:
@@ -1583,7 +1585,7 @@ class RagHandler(SimpleHTTPRequestHandler):
             return
 
         log_event('gen_request', ip, 'POST', '/generate', request_id=request_id,
-                  request_body=prompt[:200])
+                  request_body=prompt)
         t0 = time.time()
         infer_enter()
         with gen_gate:
@@ -1604,7 +1606,7 @@ class RagHandler(SimpleHTTPRequestHandler):
         latency_ms = int((time.time() - t0) * 1000)
         log_event('gen_response', ip, 'POST', '/generate', request_id=request_id,
                   status=200, latency_ms=latency_ms,
-                  response_body=text[:500] if text else '')
+                  response_body=text or '')
         self._json_response({'text': text}, 200, request_id=request_id)
 
     # ── P4 endpoints ──────────────────────────────────────────────────────────
@@ -1909,10 +1911,10 @@ class RagHandler(SimpleHTTPRequestHandler):
         log_event('retrieve_request', ip, 'POST', '/retrieve',
                   request_id=request_id,
                   request_body=json.dumps({
-                      'question': question[:200],
+                      'question': question,
                       'scope':    scope,
                       'k':        k,
-                  }))
+                  }, ensure_ascii=False))
 
         t0 = time.time()
 
@@ -1923,7 +1925,7 @@ class RagHandler(SimpleHTTPRequestHandler):
         prefixed_question = 'search_query: ' + question
         log_event('embed_request', ip, 'POST', '/retrieve',
                   request_id=request_id,
-                  request_body=prefixed_question[:200])
+                  request_body=prefixed_question)
         embed_t0 = time.time()
         with embed_gate:
             try:
@@ -2052,7 +2054,7 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         log_event('enqueue', ip, 'POST', '/enqueue',
                   request_id=request_id, chat_session_id=sid,
-                  request_body=content[:200])
+                  request_body=content)
 
         self._json_response(
             {'request_id': request_id, 'session_id': sid},
@@ -2243,8 +2245,11 @@ class RagHandler(SimpleHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        # Log the FULL response body for every API response -- accurate, untruncated
+        # records of everything sent to the browser are required.
         log_event('http_response', ip, self.command, self.path.partition('?')[0],
-                  request_id=request_id, status=status)
+                  request_id=request_id, status=status,
+                  response_body=data.decode('utf-8', 'replace'))
 
 
 ##############################################################################
