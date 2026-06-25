@@ -4,22 +4,32 @@
 # dependencies = [
 #     "huggingface_hub",
 #     "llama-cpp-python==0.3.30; sys_platform == 'linux'",
+#     "pypdf>=4.0",
+#     "sqlite-vec",
 # ]
 # ///
 """
-slm-rag serve.py -- P3: two backends, two gates (embed = CPU, gen = GPU/CPU).
+slm-rag serve.py -- P4: ingestion pipeline (drop -> searchable).
 
-Extends the P0 skeleton to wire up:
-  - HF auto-download (smallest first): nomic-embed-text-v1.5 Q4_K_M, then Phi-4-mini Q4_K_M
-  - Embedder backend: llama-server on port 52852, CPU-only (--n-gpu-layers 0), --embedding flag
-  - Phi backend:      llama-server on port 52851, GPU if VRAM fits, else CPU
-  - Two independent gates (threading.Lock): embed_gate, gen_gate
-    - A request acquires them SEQUENTIALLY, never nested.
-    - Ingestion (P4) will batch-yield the embed gate between chunks; the seam is here.
-  - POST /embed {"text":"..."}   -> {"embedding":[...768 floats...]}
-  - POST /generate {"prompt":"..."} -> {"text":"..."}  (minimal; full chat in P6)
-  - Updated GET /health returning backend status
-  - Updated --check printing both backends with CPU/GPU placement
+Extends P3 to wire together db.py (P1), ingest_lib.py (P2), and the embed gate
+(P3) into a full ingestion pipeline:
+
+  - POST /ingest (multipart file upload): save file under ragdocs/, insert a
+    documents row with status 'vectorizing', kick off background ingestion.
+    Background worker: ingest_lib.ingest_file -> embed each chunk through the
+    embed gate in small batches (yielding the gate between batches so an
+    interactive query can slip in) -> store chunks + vectors via db.py helpers.
+    When all chunks are stored, set status 'ready'.  On error set 'error'.
+  - GET /tree: return the ingested corpus as JSON (files/folders under ragdocs/)
+    with status and chunk count per file.
+  - GET /doc?path=<p>: return the stored text (or preview) of an ingested file.
+  - --db <path>: path to rag.db (default BASE_DIR/rag.db); no env var.
+
+P3 endpoints retained: POST /embed, POST /generate, GET /health.
+
+EMBEDDING NOTE: nomic-embed-text v1.5 uses task prefixes.  Document chunks are
+prefixed with 'search_document: ' before embedding.  P5 retrieval MUST use
+'search_query: ' for the question vector so they live in the same embedding space.
 
 Port default: 51548 (the only port-selection mechanism; no env vars).
 Model ports: 52851 (Phi/gen), 52852 (embedder).
@@ -39,7 +49,7 @@ import http.client
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, parse_qs
 from datetime import datetime, timezone
 
 # ── stdout / stderr always UTF-8, even on Windows ────────────────────────────
@@ -47,7 +57,8 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+RAGDOCS_DIR = os.path.join(BASE_DIR, 'ragdocs')  # ingested source files live here
 
 # Default listen port.  --port is the ONLY override; there is no env var.
 DEFAULT_PORT = 51548
@@ -59,6 +70,22 @@ EMBED_PORT  = 52852
 
 # CPU threads for llama-server (used for both backends)
 THREADS = 4
+
+# ── Local module imports (db.py, ingest_lib.py live next to serve.py) ─────────
+# These must come after BASE_DIR is defined so the path is available for sys.path.
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+import db as _db_mod           # db.py: init_db, insert_chunk, knn_chunks …
+import ingest_lib as _ingest   # ingest_lib.py: extract_text, chunk_text, ingest_file
+
+# ── Global database connection (set in main()) ────────────────────────────────
+# init_db() is called once at startup with the path from --db (or the default).
+# The connection is shared across threads; db.connect() uses check_same_thread=False.
+_db_conn = None   # sqlite3.Connection, set in main()
+_db_lock = threading.Lock()   # serialises multi-step transactions from different threads
+
+# Default db path (can be overridden with --db flag; no env var)
+DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
 
 
 ##############################################################################
@@ -307,6 +334,107 @@ def ensure_weights():
 
 embed_gate = threading.Lock()   # serializes the vector/embedder model
 gen_gate   = threading.Lock()   # serializes the language/Phi model
+
+# ── Ingestion constants ───────────────────────────────────────────────────────
+
+# nomic-embed-text v1.5 model identifier stored in chunk_vec_meta.
+# If the model changes, stored embedders can be detected and rebuilt.
+EMBEDDER_ID = 'nomic-embed-text-v1.5'
+
+# Number of chunks to embed per gate-acquisition.  After each batch the embed
+# gate is released so an interactive query-embed can slip in between batches.
+INGEST_BATCH_SIZE = 4
+
+
+##############################################################################
+# Ingestion pipeline -- background worker
+##############################################################################
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: str):
+    """
+    Background worker: extract -> chunk -> embed (in batches, yielding the embed
+    gate between batches) -> store chunks + vectors -> set doc status ready/error.
+
+    Runs in a daemon thread; logs errors to stdout and sets doc status='error'.
+
+    EMBEDDING PREFIX: nomic-embed-text v1.5 requires task-type prefixes for
+    asymmetric retrieval quality.  Each document chunk is prefixed with
+    'search_document: ' here.  P5 retrieval MUST use 'search_query: ' for the
+    question so query and document vectors live in the same embedding space.
+    """
+    try:
+        # ── Step 1: extract text and chunk ───────────────────────────────────
+        chunks = _ingest.ingest_file(file_path)
+
+        # Update n_chunks in the documents row now that we know the count
+        with _db_lock:
+            _db_conn.execute(
+                "UPDATE documents SET n_chunks=? WHERE id=?",
+                (len(chunks), doc_id),
+            )
+            _db_conn.commit()
+
+        # ── Step 2: embed in batches, yielding the embed gate between batches ─
+        # Breaking into INGEST_BATCH_SIZE chunks per gate-acquisition lets an
+        # interactive /embed call slip in between batches instead of waiting for
+        # the entire document to be embedded before it can proceed.
+        for batch_start in range(0, len(chunks), INGEST_BATCH_SIZE):
+            batch = chunks[batch_start: batch_start + INGEST_BATCH_SIZE]
+
+            # ── YIELD POINT: acquire the embed gate for this batch only ───────
+            # After the batch is embedded and stored we release the gate before
+            # taking it again for the next batch.  Any /embed request waiting on
+            # the lock will be served between batches.
+            with embed_gate:   # <-- acquire gate for one batch
+                embedded_batch = []
+                for chunk in batch:
+                    # Prefix with 'search_document: ' for nomic-embed-text v1.5
+                    # asymmetric retrieval.  P5 uses 'search_query: ' on the question.
+                    prefixed_text = 'search_document: ' + chunk['text']
+                    vector = _embed_backend.embed(prefixed_text)
+                    embedded_batch.append((chunk, vector))
+            # embed_gate is released here -- next /embed or next batch can proceed
+
+            # ── Step 3: store each chunk + vector ────────────────────────────
+            with _db_lock:
+                for chunk, vector in embedded_batch:
+                    _db_mod.insert_chunk(
+                        _db_conn,
+                        doc_id=doc_id,
+                        chunk_index=chunk['chunk_index'],
+                        text=chunk['text'],
+                        char_start=chunk['char_start'],
+                        char_end=chunk['char_end'],
+                        embedding=vector,
+                        embedder_id=EMBEDDER_ID,
+                    )
+                _db_conn.commit()
+
+        # ── Step 4: mark document ready ──────────────────────────────────────
+        with _db_lock:
+            _db_conn.execute(
+                "UPDATE documents SET status='ready' WHERE id=?", (doc_id,)
+            )
+            _db_conn.commit()
+        print(f'[serve] ingest complete: doc_id={doc_id} rel_path={rel_path!r} '
+              f'n_chunks={len(chunks)}', flush=True)
+
+    except Exception as exc:
+        print(f'[serve] ingest ERROR: doc_id={doc_id} rel_path={rel_path!r}: {exc}',
+              flush=True)
+        try:
+            with _db_lock:
+                _db_conn.execute(
+                    "UPDATE documents SET status='error', error_msg=? WHERE id=?",
+                    (str(exc)[:1000], doc_id),
+                )
+                _db_conn.commit()
+        except Exception:
+            pass
 
 
 ##############################################################################
@@ -773,6 +901,10 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_health(request_id)
         elif path == '/shutdown':
             self._handle_shutdown('GET', query, request_id)
+        elif path == '/tree':
+            self._handle_tree(request_id)
+        elif path == '/doc':
+            self._handle_doc(query, request_id)
         elif path == '/':
             self.path = '/index.html'
             super().do_GET()
@@ -790,7 +922,7 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         log_event('http_request', ip, 'POST', path,
                   request_id=request_id,
-                  request_body=body.decode('utf-8', 'replace') if body else None)
+                  request_body=body.decode('utf-8', 'replace')[:500] if body else None)
 
         if path == '/shutdown':
             self._handle_shutdown('POST', '', request_id)
@@ -798,6 +930,8 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_embed(body, request_id)
         elif path == '/generate':
             self._handle_generate(body, request_id)
+        elif path == '/ingest':
+            self._handle_ingest(body, request_id)
         else:
             self._json_response({'error': 'Not found'}, 404, request_id=request_id)
 
@@ -917,6 +1051,249 @@ class RagHandler(SimpleHTTPRequestHandler):
                   response_body=text[:500] if text else '')
         self._json_response({'text': text}, 200, request_id=request_id)
 
+    # ── P4 endpoints ──────────────────────────────────────────────────────────
+
+    def _parse_multipart(self, body: bytes):
+        """Parse a multipart/form-data body manually.
+        Returns (filename, file_bytes) or raises ValueError.
+
+        Parses the boundary from Content-Type, splits the body on boundary
+        markers, and returns the first part that has a filename= in its
+        Content-Disposition header.
+        """
+        content_type = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' not in content_type:
+            raise ValueError(f'Expected multipart/form-data, got: {content_type!r}')
+
+        # Extract boundary from Content-Type: multipart/form-data; boundary=XXXX
+        boundary = None
+        for seg in content_type.split(';'):
+            seg = seg.strip()
+            if seg.lower().startswith('boundary='):
+                boundary = seg[9:].strip().strip('"\'')
+                break
+        if not boundary:
+            raise ValueError(f'No boundary in Content-Type: {content_type!r}')
+
+        # Split body on --boundary (RFC 2046 uses CRLF--boundary)
+        delim = ('--' + boundary).encode('ascii')
+        parts = body.split(delim)
+
+        for part in parts:
+            # Each part: \r\n<headers>\r\n\r\n<content>\r\n
+            # Strip leading \r\n
+            if part.startswith(b'\r\n'):
+                part = part[2:]
+            # Skip the final boundary terminator '--\r\n'
+            if part in (b'--', b'--\r\n', b''):
+                continue
+
+            # Split part headers from content at the first blank line (\r\n\r\n)
+            sep = b'\r\n\r\n'
+            sep_idx = part.find(sep)
+            if sep_idx < 0:
+                continue
+            raw_headers = part[:sep_idx].decode('utf-8', 'replace')
+            content = part[sep_idx + 4:]
+            # Content ends with \r\n before the next boundary; strip trailing \r\n
+            if content.endswith(b'\r\n'):
+                content = content[:-2]
+
+            # Parse Content-Disposition to find filename
+            fname = None
+            for header_line in raw_headers.splitlines():
+                hl = header_line.strip()
+                if hl.lower().startswith('content-disposition:'):
+                    for token in hl.split(';'):
+                        token = token.strip()
+                        if token.lower().startswith('filename='):
+                            fname = token[9:].strip().strip('"\'')
+                            break
+                if fname:
+                    break
+
+            if fname:
+                return fname, content
+
+        raise ValueError('No file part with filename= found in multipart body')
+
+    def _handle_ingest(self, body: bytes, request_id: str):
+        """POST /ingest -- multipart file upload or JSON {path, content}.
+
+        Saves the file under ragdocs/, inserts a documents row (status='vectorizing'),
+        fires off a background thread for the ingestion pipeline, and returns
+        immediately with {doc_id, status, path}.
+        """
+        ip = self.client_address[0]
+        content_type = self.headers.get('Content-Type', '')
+
+        # ── Parse the incoming file ──────────────────────────────────────────
+        filename = None
+        file_bytes = None
+
+        if 'multipart/form-data' in content_type:
+            try:
+                filename, file_bytes = self._parse_multipart(body)
+            except ValueError as e:
+                self._json_response({'error': str(e)}, 400, request_id=request_id)
+                return
+        elif 'application/json' in content_type or not content_type:
+            # JSON: {"path": "relative/name.txt", "content": "<text>"}
+            try:
+                obj = json.loads(body)
+                filename = obj.get('path') or obj.get('filename')
+                content  = obj.get('content', '')
+                if not filename:
+                    raise ValueError('"path" or "filename" required in JSON body')
+                file_bytes = content.encode('utf-8') if isinstance(content, str) else content
+            except (json.JSONDecodeError, ValueError, AttributeError) as e:
+                self._json_response({'error': str(e)}, 400, request_id=request_id)
+                return
+        else:
+            self._json_response(
+                {'error': 'Unsupported Content-Type; use multipart/form-data or application/json'},
+                415, request_id=request_id)
+            return
+
+        if not filename:
+            self._json_response({'error': 'No filename provided'}, 400, request_id=request_id)
+            return
+
+        # Sanitise: strip leading path separators / drive letters to avoid escaping ragdocs/
+        rel_path = filename.replace('\\', '/').lstrip('/')
+        if not rel_path:
+            self._json_response({'error': 'Empty filename after sanitisation'}, 400,
+                                request_id=request_id)
+            return
+
+        # ── Save file under ragdocs/ ─────────────────────────────────────────
+        dest_path = os.path.join(RAGDOCS_DIR, rel_path.replace('/', os.sep))
+        dest_dir  = os.path.dirname(dest_path)
+        os.makedirs(dest_dir if dest_dir else RAGDOCS_DIR, exist_ok=True)
+        with open(dest_path, 'wb') as f:
+            f.write(file_bytes)
+
+        # ── Insert documents row with status='vectorizing' ───────────────────
+        ts = _now_iso()
+        try:
+            with _db_lock:
+                cur = _db_conn.execute(
+                    "INSERT OR REPLACE INTO documents(path, status, ts) VALUES(?,?,?)",
+                    (rel_path, 'vectorizing', ts),
+                )
+                doc_id = cur.lastrowid
+                _db_conn.commit()
+        except Exception as e:
+            self._json_response({'error': f'DB insert failed: {e}'}, 500,
+                                request_id=request_id)
+            return
+
+        log_event('ingest_queued', ip, 'POST', '/ingest', request_id=request_id,
+                  doc_id=doc_id, rel_path=rel_path)
+
+        # ── Kick off background ingestion ────────────────────────────────────
+        t = threading.Thread(
+            target=_ingest_background,
+            args=(doc_id, dest_path, rel_path, request_id),
+            daemon=True,
+        )
+        t.start()
+
+        self._json_response({'doc_id': doc_id, 'status': 'vectorizing', 'path': rel_path},
+                            200, request_id=request_id)
+
+    def _handle_tree(self, request_id: str):
+        """GET /tree -- return the ingested corpus as JSON.
+
+        Returns a list of file entries under ragdocs/, each with:
+            path        : relative path under ragdocs/
+            status      : 'vectorizing' | 'ready' | 'error' | 'pending'
+            chunk_count : number of stored chunks (from DB n_chunks column)
+        """
+        ip = self.client_address[0]
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503, request_id=request_id)
+            return
+
+        try:
+            with _db_lock:
+                rows = _db_conn.execute(
+                    "SELECT path, status, n_chunks FROM documents ORDER BY path"
+                ).fetchall()
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        files = []
+        for path, status, n_chunks in rows:
+            files.append({
+                'path':        path,
+                'status':      status,
+                'chunk_count': n_chunks or 0,
+            })
+
+        self._json_response({'files': files}, 200, request_id=request_id)
+
+    def _handle_doc(self, query: str, request_id: str):
+        """GET /doc?path=<rel_path> -- return stored text of an ingested file.
+
+        Returns {path, status, chunks: [{chunk_index, text, char_start, char_end}, ...]}.
+        If the file is still vectorizing, returns what chunks are available so far.
+        """
+        ip = self.client_address[0]
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503, request_id=request_id)
+            return
+
+        # Parse ?path= from query string
+        params = parse_qs(query or '')
+        rel_path_list = params.get('path', [])
+        if not rel_path_list:
+            self._json_response({'error': 'path parameter required'}, 400,
+                                request_id=request_id)
+            return
+        rel_path = rel_path_list[0]
+
+        try:
+            with _db_lock:
+                doc_row = _db_conn.execute(
+                    "SELECT id, path, status, n_chunks FROM documents WHERE path=?",
+                    (rel_path,)
+                ).fetchone()
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        if doc_row is None:
+            self._json_response({'error': f'Document not found: {rel_path!r}'}, 404,
+                                request_id=request_id)
+            return
+
+        doc_id, path, status, n_chunks = doc_row
+
+        try:
+            with _db_lock:
+                chunk_rows = _db_conn.execute(
+                    "SELECT chunk_index, text, char_start, char_end "
+                    "FROM chunks WHERE doc_id=? ORDER BY chunk_index",
+                    (doc_id,)
+                ).fetchall()
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        chunks_out = [
+            {'chunk_index': ci, 'text': t, 'char_start': cs, 'char_end': ce}
+            for ci, t, cs, ce in chunk_rows
+        ]
+
+        self._json_response({
+            'path':        path,
+            'status':      status,
+            'n_chunks':    n_chunks,
+            'chunks':      chunks_out,
+        }, 200, request_id=request_id)
+
     def _handle_shutdown(self, method, query, request_id):
         """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
         ip = self.client_address[0]
@@ -995,6 +1372,7 @@ COMMAND_LINE_HELP = """\
   --web        Run the web server only.  This is the default.
   --cli        Run the web server and attach a terminal chat (stub in P3; full in P7).
   --port <n>   Listen port (default 51548).  This flag is the only override.
+  --db <path>  Path to rag.db SQLite file (default BASE_DIR/rag.db).  No env var.
   --check      Print the planned backend layout and exit.  No downloads, no
                models start, no socket opened.
   --help       Print this help and exit.
@@ -1011,6 +1389,7 @@ def parse_args(argv):
     mode         = 'web'
     mode_flags   = []
     port         = DEFAULT_PORT
+    db_path      = DEFAULT_DB
     check        = False
     help_wanted  = False
 
@@ -1030,6 +1409,12 @@ def parse_args(argv):
             except ValueError:
                 print('[serve] --port requires a number, e.g. --port 8080', flush=True)
                 sys.exit(2)
+        elif arg == '--db':
+            i += 1
+            if i >= len(argv):
+                print('[serve] --db requires a path, e.g. --db /tmp/test.db', flush=True)
+                sys.exit(2)
+            db_path = argv[i]
         elif arg == '--check':
             check = True
         elif arg in ('--help', '-h'):
@@ -1043,7 +1428,8 @@ def parse_args(argv):
         print('[serve] choose one mode: --web or --cli', flush=True)
         sys.exit(2)
 
-    return {'mode': mode, 'port': port, 'check': check, 'help': help_wanted}
+    return {'mode': mode, 'port': port, 'db_path': db_path, 'check': check,
+            'help': help_wanted}
 
 
 ##############################################################################
@@ -1051,17 +1437,27 @@ def parse_args(argv):
 ##############################################################################
 
 def main():
+    global _db_conn
+
     args = parse_args(sys.argv[1:])
 
     if args['help']:
         print(COMMAND_LINE_HELP.rstrip(), flush=True)
         return
 
-    port = args['port']
+    port    = args['port']
+    db_path = args['db_path']
 
     if args['check']:
         describe_plan(port)
         return       # no socket, no downloads, exit 0
+
+    # ── initialise the SQLite database (P1: init_db creates all tables) ───────
+    print(f'[serve] opening rag.db at {db_path}', flush=True)
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    os.makedirs(RAGDOCS_DIR, exist_ok=True)
+    _db_conn = _db_mod.init_db(db_path)
+    print('[serve] rag.db ready', flush=True)
 
     # ── ensure llama-server binary is present (Windows: download if missing) ─
     ensure_llama_server()
@@ -1096,7 +1492,7 @@ def main():
     server_thread.start()
     print(f'[serve] listening on http://{HOST}:{port}', flush=True)
     log_event('startup', '127.0.0.1', 'START', '/',
-              port=port, version='p3-backends')
+              port=port, version='p4-ingest', db_path=db_path)
 
     if args['mode'] == 'cli':
         cli_stub(f'http://{HOST}:{port}')
