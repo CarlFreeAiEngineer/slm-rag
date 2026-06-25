@@ -146,6 +146,21 @@
     .badge-error       { background: #fee2e2; color: #991b1b; }
     .badge-pending     { background: #f3f4f6; color: #6b7280; }
 
+    .delete-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 0.1rem 0.2rem;
+      color: #9ca3af;
+      flex-shrink: 0;
+      line-height: 1;
+      border-radius: 3px;
+      opacity: 0;
+      transition: opacity 0.1s, color 0.1s;
+    }
+    .tree-item:hover .delete-btn { opacity: 1; }
+    .delete-btn:hover { color: #dc2626; }
+
     /* ── Right panel: chat ─────────────────────────────────────────── */
     .panel-right {
       flex: 1;
@@ -558,19 +573,42 @@ function renderTree(files) {
     const badgeLabel = f.status === 'ready'
       ? `ready · ${f.chunk_count} chunks`
       : (f.status || 'pending');
+    const trashSvg = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+      <path d="M10 11v6"/><path d="M14 11v6"/>
+      <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+    </svg>`;
     return `<li class="tree-item" data-path="${escapeHtml(f.path)}"
                title="${escapeHtml(f.path)}">
       <span class="item-name">${escapeHtml(f.path)}</span>
       <span class="${badgeClass}">${escapeHtml(badgeLabel)}</span>
+      <button class="delete-btn" data-path="${escapeHtml(f.path)}"
+              title="Delete ${escapeHtml(f.path)}">${trashSvg}</button>
     </li>`;
   }).join('');
 
-  // Click to preview
+  // Click to preview (ignore clicks on the delete button)
   treeList.querySelectorAll('.tree-item').forEach(li => {
-    li.addEventListener('click', () => {
+    li.addEventListener('click', e => {
+      if (e.target.closest('.delete-btn')) return;
       treeList.querySelectorAll('.tree-item').forEach(x => x.classList.remove('active'));
       li.classList.add('active');
       openPreview(li.dataset.path, null);
+    });
+  });
+
+  // Trash icon: instant delete, no confirm
+  treeList.querySelectorAll('.delete-btn').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      try {
+        await apiFetch('POST', '/delete', { path });
+      } catch (err) {
+        console.error('delete failed', err);
+      }
+      fetchTree();
     });
   });
 }

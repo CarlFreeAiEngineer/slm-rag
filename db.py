@@ -66,17 +66,33 @@ def init_db(path: str) -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            path        TEXT    NOT NULL UNIQUE,   -- relative path under ragdocs/
+            path        TEXT    NOT NULL UNIQUE,   -- logical name / tree path
             status      TEXT    NOT NULL DEFAULT 'pending',
                                                    -- pending | vectorizing | ready | error
             n_chunks    INTEGER,                   -- filled in after chunking
             error_msg   TEXT,                      -- set on status='error'
-            ts          TEXT    NOT NULL           -- ISO-8601 UTC, time of insertion
+            ts          TEXT    NOT NULL,          -- ISO-8601 UTC, time of insertion
+            content     BLOB,                      -- raw uploaded bytes
+            byte_size   INTEGER,                   -- len(content)
+            ext         TEXT                       -- file extension, e.g. '.md'
         )
     """)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)"
     )
+
+    # Migration: add columns that may be missing in an existing rag.db.
+    # CREATE TABLE IF NOT EXISTS won't add new columns to a pre-existing table,
+    # so we inspect PRAGMA table_info and ALTER TABLE for each new column.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    for col_def in (
+        ("content",   "BLOB"),
+        ("byte_size", "INTEGER"),
+        ("ext",       "TEXT"),
+    ):
+        col_name, col_type = col_def
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
 
     # -- chunks --------------------------------------------------------------
     conn.execute("""
@@ -521,6 +537,89 @@ def clear_session(conn: sqlite3.Connection, session_id: str) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+def insert_document(
+    conn: sqlite3.Connection,
+    path: str,
+    content: bytes,
+    ext: str,
+) -> int:
+    """Insert (or cleanly replace) a document row.
+
+    First removes any existing doc at *path* including all its chunks and
+    vectors (via delete_document), then inserts a fresh row with
+    status='vectorizing' and the raw uploaded bytes stored as a BLOB.
+
+    Using delete + fresh insert instead of INSERT OR REPLACE avoids the bug
+    where a plain REPLACE would leave orphaned chunks/vectors in the DB.
+
+    Returns the new doc_id.
+    """
+    delete_document(conn, path)   # no-op if path not present
+    ts = _now()
+    cur = conn.execute(
+        "INSERT INTO documents(path, status, ts, content, byte_size, ext) "
+        "VALUES(?, 'vectorizing', ?, ?, ?, ?)",
+        (path, ts, content, len(content), ext),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_document_blob(
+    conn: sqlite3.Connection,
+    path: str,
+) -> bytes | None:
+    """Return the raw bytes stored for *path*, or None if not found."""
+    row = conn.execute(
+        "SELECT content FROM documents WHERE path=?", (path,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+def delete_document(
+    conn: sqlite3.Connection,
+    path: str,
+) -> bool:
+    """Delete a document and all its chunks / vectors.
+
+    Returns True if the document existed, False if not found.
+
+    FK cascade is deliberately NOT relied on here: connect() does not enable
+    PRAGMA foreign_keys, and chunk_vecs is a vec0 virtual table that ignores
+    cascade rules regardless.  Each related table is therefore deleted
+    explicitly in dependency order.
+    """
+    row = conn.execute(
+        "SELECT id FROM documents WHERE path=?", (path,)
+    ).fetchone()
+    if row is None:
+        return False
+    doc_id = row[0]
+
+    # Gather all chunk ids for this document.
+    chunk_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM chunks WHERE doc_id=?", (doc_id,)
+    ).fetchall()]
+
+    if chunk_ids:
+        placeholders = ','.join('?' * len(chunk_ids))
+        conn.execute(
+            f"DELETE FROM chunk_vecs WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
+        conn.execute(
+            f"DELETE FROM chunk_vec_meta WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
+        conn.execute(
+            "DELETE FROM chunks WHERE doc_id=?", (doc_id,)
+        )
+
+    conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+    conn.commit()
+    return True
 
 
 def get_chunk_by_id(

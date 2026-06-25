@@ -202,11 +202,9 @@ def main():
     port = _free_port()
     base = f'http://127.0.0.1:{port}'
 
-    # ── Temp workspace (hermetic: own db and ragdocs dir) ─────────────────────
-    tmpdir = tempfile.mkdtemp(prefix='p4_test_')
-    db_path     = os.path.join(tmpdir, 'test.db')
-    ragdocs_dir = os.path.join(tmpdir, 'ragdocs')
-    os.makedirs(ragdocs_dir, exist_ok=True)
+    # ── Temp workspace (hermetic: own db) ─────────────────────────────────────
+    tmpdir  = tempfile.mkdtemp(prefix='p4_test_')
+    db_path = os.path.join(tmpdir, 'test.db')
 
     print(f'[test] tmpdir:   {tmpdir}', flush=True)
     print(f'[test] db_path:  {db_path}', flush=True)
@@ -301,7 +299,7 @@ def main():
             conn.enable_load_extension(False)
 
             doc_row = conn.execute(
-                "SELECT id, status, n_chunks FROM documents WHERE path=?",
+                "SELECT id, status, n_chunks, byte_size, ext FROM documents WHERE path=?",
                 (ingest_rel_path,)
             ).fetchone()
 
@@ -311,7 +309,7 @@ def main():
                 db_doc_id = None
                 db_n_chunks = 0
             else:
-                db_doc_id, db_status, db_n_chunks = doc_row
+                db_doc_id, db_status, db_n_chunks, db_byte_size, db_ext = doc_row
                 check('documents row exists in DB', True,
                       f'doc_id={db_doc_id}')
                 check("documents status is 'ready' in DB", db_status == 'ready',
@@ -319,6 +317,15 @@ def main():
                 check('DB n_chunks matches tree chunk_count',
                       db_n_chunks == tree_chunk_count,
                       f'db={db_n_chunks} tree={tree_chunk_count}')
+
+                # Verify blob was stored: byte_size must match the uploaded byte count
+                check('documents row has byte_size == uploaded bytes',
+                      db_byte_size == len(md_bytes),
+                      f'db_byte_size={db_byte_size} uploaded={len(md_bytes)}')
+                # Verify ext is set
+                check('documents row has ext set',
+                      bool(db_ext),
+                      f'ext={db_ext!r}')
 
                 # Count actual chunks rows
                 n_chunk_rows = conn.execute(
@@ -382,6 +389,70 @@ def main():
                   'sqlite_vec not importable in test process')
         except Exception as e:
             check('DB direct check', False, str(e))
+
+        # ── Check 5: delete the document via POST /delete ─────────────────────
+        print(f'[test] deleting {ingest_rel_path!r} via POST /delete ...', flush=True)
+        del_code, del_resp = _api_post_json(base, '/delete',
+                                            {'path': ingest_rel_path}, timeout=10)
+        check('POST /delete returns 200', del_code == 200,
+              f'got {del_code}: {del_resp}')
+        check('POST /delete response ok=true', del_resp.get('ok') is True,
+              f'resp={del_resp}')
+        check('POST /delete response deleted=true', del_resp.get('deleted') is True,
+              f'resp={del_resp}')
+
+        # File must no longer appear in /tree
+        _, tree_after = _api_get(base, '/tree', timeout=10)
+        paths_after = [e.get('path') for e in tree_after.get('files', [])]
+        check('file absent from /tree after delete',
+              ingest_rel_path not in paths_after,
+              f'paths={paths_after}')
+
+        # Direct DB check: 0 chunks and 0 chunk_vecs after delete
+        try:
+            import sqlite_vec
+            conn2 = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True,
+                                    check_same_thread=False)
+            conn2.enable_load_extension(True)
+            sqlite_vec.load(conn2)
+            conn2.enable_load_extension(False)
+
+            doc_gone = conn2.execute(
+                "SELECT id FROM documents WHERE path=?", (ingest_rel_path,)
+            ).fetchone()
+            check('documents row gone after delete', doc_gone is None,
+                  f'row={doc_gone}')
+
+            # db_doc_id from above; if it was set, verify chunks and vecs are gone
+            if db_doc_id is not None:
+                remaining_chunks = conn2.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE doc_id=?", (db_doc_id,)
+                ).fetchone()[0]
+                check('0 chunks remain after delete', remaining_chunks == 0,
+                      f'remaining={remaining_chunks}')
+
+                # chunk_vecs check using the chunk_ids we gathered earlier
+                if chunk_ids:
+                    remaining_vecs = conn2.execute(
+                        "SELECT COUNT(*) FROM chunk_vecs WHERE chunk_id IN ({})".format(
+                            ','.join('?' * len(chunk_ids))
+                        ),
+                        chunk_ids
+                    ).fetchone()[0]
+                    check('0 chunk_vecs remain after delete', remaining_vecs == 0,
+                          f'remaining={remaining_vecs}')
+
+            conn2.close()
+        except Exception as e:
+            check('DB delete verification', False, str(e))
+
+        # A second delete of the same path should return 404 / deleted=false
+        del2_code, del2_resp = _api_post_json(base, '/delete',
+                                              {'path': ingest_rel_path}, timeout=10)
+        check('second POST /delete returns 404', del2_code == 404,
+              f'got {del2_code}: {del2_resp}')
+        check('second POST /delete deleted=false', del2_resp.get('deleted') is False,
+              f'resp={del2_resp}')
 
     finally:
         # ── Clean up ──────────────────────────────────────────────────────────

@@ -44,6 +44,7 @@ text and is documented in the chunk dicts so callers can see what was used.
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,53 @@ def _tokens_to_words(n_tokens: int) -> int:
 # Text extraction
 # ---------------------------------------------------------------------------
 
+def extract_text_from_bytes(filename_or_ext: str, data: bytes) -> str:
+    """
+    Extract plain text from raw *data* bytes.
+
+    Parameters
+    ----------
+    filename_or_ext : the filename or just the extension (e.g. 'doc.md' or '.md')
+    data            : raw file bytes
+
+    Supported extensions:
+        .txt, .md   -- decoded as UTF-8 (errors='replace')
+        .pdf        -- text extracted via pypdf from an in-memory BytesIO
+
+    Raises
+    ------
+    ValueError
+        If the file extension is not supported.
+    """
+    suffix = Path(filename_or_ext).suffix.lower()
+
+    if suffix in (".txt", ".md"):
+        return data.decode("utf-8", errors="replace")
+
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "pypdf is required for PDF extraction. "
+                "Run this script with `uv run ingest_lib.py` so the inline "
+                "dependency is auto-installed."
+            ) from exc
+
+        reader = PdfReader(io.BytesIO(data))
+        pages: list[str] = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        return "\n".join(pages)
+
+    raise ValueError(
+        f"Unsupported file type: '{suffix}'. "
+        "Supported extensions: .txt, .md, .pdf"
+    )
+
+
 def extract_text(path: str | Path) -> str:
     """
     Extract plain text from *path*.
@@ -81,43 +129,15 @@ def extract_text(path: str | Path) -> str:
         If the file extension is not supported.
     FileNotFoundError
         If the file does not exist.
+
+    Delegates to extract_text_from_bytes so both paths share one implementation.
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    ext = path.suffix.lower()
-
-    if ext in (".txt", ".md"):
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return path.read_text(encoding="latin-1")
-
-    if ext == ".pdf":
-        # pypdf is declared in the inline script metadata above.
-        # Import lazily so callers that never touch PDFs pay no cost.
-        try:
-            from pypdf import PdfReader  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise ImportError(
-                "pypdf is required for PDF extraction. "
-                "Run this script with `uv run ingest_lib.py` so the inline "
-                "dependency is auto-installed."
-            ) from exc
-
-        reader = PdfReader(str(path))
-        pages: list[str] = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages.append(text)
-        return "\n".join(pages)
-
-    raise ValueError(
-        f"Unsupported file type: '{ext}'. "
-        "Supported extensions: .txt, .md, .pdf"
-    )
+    data = path.read_bytes()
+    return extract_text_from_bytes(path.name, data)
 
 
 # ---------------------------------------------------------------------------

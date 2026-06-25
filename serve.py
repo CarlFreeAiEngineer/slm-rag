@@ -71,7 +71,6 @@ if sys.stdout.encoding != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8')
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-RAGDOCS_DIR = os.path.join(BASE_DIR, 'ragdocs')  # ingested source files live here
 
 # Default listen port.  --port is the ONLY override; there is no env var.
 DEFAULT_PORT = 51548
@@ -215,6 +214,12 @@ def gpu_layers_for_phi():
       macOS   -> '99' (Apple Metal, unified memory)
       NVIDIA  -> '99' if Phi (~2.4 GB + headroom) fits in free VRAM, else '0'
       no GPU  -> '0'
+
+    The free reading is taken AFTER reap_orphan_backends() (see main()), which kills
+    any leftover llama-server -- we are the only llama.cpp process, so any other one is
+    an orphan holding VRAM (the "trick"). Browser/desktop VRAM use is real and IS
+    respected, so we read free (not total) once the orphans are gone. A genuine OOM
+    still falls back to CPU via ProxyBackend.boot().
     """
     if sys.platform == 'darwin':
         return '99'
@@ -467,10 +472,11 @@ def _embed_resilient(text, attempts=3, timeout=120):
     raise last
 
 
-def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: str):
+def _ingest_background(doc_id: int, rel_path: str, request_id: str):
     """
-    Background worker: extract -> chunk -> embed (in batches, yielding the embed
-    gate between batches) -> store chunks + vectors -> set doc status ready/error.
+    Background worker: read blob -> extract -> chunk -> embed (in batches,
+    yielding the embed gate between batches) -> store chunks + vectors ->
+    set doc status ready/error.
 
     Runs in a daemon thread; logs errors to stdout and sets doc status='error'.
 
@@ -480,8 +486,17 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
     question so query and document vectors live in the same embedding space.
     """
     try:
-        # ── Step 1: extract text and chunk ───────────────────────────────────
-        chunks = _ingest.ingest_file(file_path)
+        # ── Step 1: read the blob from the DB ────────────────────────────────
+        with _db_lock:
+            data = _db_mod.get_document_blob(_db_conn, rel_path)
+        if data is None:
+            raise RuntimeError(f'Blob not found in DB for path={rel_path!r}')
+
+        # ── Step 2: extract text and chunk ───────────────────────────────────
+        text = _ingest.extract_text_from_bytes(rel_path, data)
+        chunks = _ingest.chunk_text(text)
+        for chunk in chunks:
+            chunk['source_path'] = rel_path
 
         # Update n_chunks in the documents row now that we know the count
         with _db_lock:
@@ -491,7 +506,7 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
             )
             _db_conn.commit()
 
-        # ── Step 2: embed in batches, yielding the embed gate between batches ─
+        # ── Step 3: embed in batches, yielding the embed gate between batches ─
         # Breaking into INGEST_BATCH_SIZE chunks per gate-acquisition lets an
         # interactive /embed call slip in between batches instead of waiting for
         # the entire document to be embedded before it can proceed.
@@ -512,7 +527,7 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
                     embedded_batch.append((chunk, vector))
             # embed_gate is released here -- next /embed or next batch can proceed
 
-            # ── Step 3: store each chunk + vector ────────────────────────────
+            # ── Step 4: store each chunk + vector ────────────────────────────
             with _db_lock:
                 for chunk, vector in embedded_batch:
                     _db_mod.insert_chunk(
@@ -527,7 +542,7 @@ def _ingest_background(doc_id: int, file_path: str, rel_path: str, request_id: s
                     )
                 _db_conn.commit()
 
-        # ── Step 4: mark document ready ──────────────────────────────────────
+        # ── Step 5: mark document ready ──────────────────────────────────────
         with _db_lock:
             _db_conn.execute(
                 "UPDATE documents SET status='ready' WHERE id=?", (doc_id,)
@@ -1237,17 +1252,49 @@ def _kill_pid(pid):
         pass
 
 
+def _kill_llama_servers_by_name():
+    """Kill every llama-server process. We are the only llama.cpp process on this box,
+    so at startup (before we boot ours) any llama-server is an orphan from a prior
+    crashed run. Such an orphan holds GPU VRAM even if it is no longer bound to our
+    ports, which skews the free-VRAM reading. Browser/desktop GPU use is left alone."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
+                           capture_output=True, timeout=15)
+        else:
+            subprocess.run(['pkill', '-9', '-f', 'llama-server'],
+                           capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def refresh_free_vram():
+    """Re-read free VRAM after reaping orphans so the GPU-vs-CPU decision sees the true
+    number. The driver reclaims VRAM from killed processes asynchronously, so settle
+    briefly before reading. Updates the GPU_FREE_GB global used by gpu_layers_for_phi."""
+    global GPU_FREE_GB
+    if GPU_TOTAL_GB is None:
+        return
+    time.sleep(1.5)
+    _, free = nvidia_vram_gb()
+    if free is not None:
+        GPU_FREE_GB = free
+        print(f'[serve] free VRAM after reap: {GPU_FREE_GB:.1f} GB '
+              f'of {GPU_TOTAL_GB:.1f} GB total', flush=True)
+
+
 def reap_orphan_backends():
-    """Free the model ports before booting: kill whatever still listens on
-    EMBED_PORT / PHI_PORT. A serve.py that crashed or was force-killed can leave
-    its llama-server children on those ports holding GPU VRAM -- which blocks our
-    boot AND skews the free-VRAM reading that decides GPU-vs-CPU offload. Reaping
-    them means every launch starts clean (last launch wins, which is what a
-    single-user desktop app wants)."""
+    """Make the GPU and ports ours before booting. We are the only llama.cpp process,
+    so kill any leftover llama-server (an orphan from a crashed run still holding VRAM),
+    then anything still listening on EMBED_PORT / PHI_PORT, then re-read free VRAM so the
+    GPU-vs-CPU decision isn't skewed by what the orphans were holding. Real browser/
+    desktop VRAM use is respected. Last launch wins -- what a single-user app wants."""
+    _kill_llama_servers_by_name()
     for port in (EMBED_PORT, PHI_PORT):
         for pid in _pids_listening_on(port):
             print(f'[serve] reaping orphan backend on port {port} (pid {pid})', flush=True)
             _kill_pid(pid)
+    refresh_free_vram()
 
 
 ##############################################################################
@@ -1439,6 +1486,8 @@ class RagHandler(SimpleHTTPRequestHandler):
             self._handle_enqueue(body, request_id)
         elif path == '/clear':
             self._handle_clear(body, request_id)
+        elif path == '/delete':
+            self._handle_delete(body, request_id)
         else:
             self._json_response({'error': 'Not found'}, 404, request_id=request_id)
 
@@ -1673,23 +1722,15 @@ class RagHandler(SimpleHTTPRequestHandler):
                                 request_id=request_id)
             return
 
-        # ── Save file under ragdocs/ ─────────────────────────────────────────
-        dest_path = os.path.join(RAGDOCS_DIR, rel_path.replace('/', os.sep))
-        dest_dir  = os.path.dirname(dest_path)
-        os.makedirs(dest_dir if dest_dir else RAGDOCS_DIR, exist_ok=True)
-        with open(dest_path, 'wb') as f:
-            f.write(file_bytes)
+        # ── Derive file extension ────────────────────────────────────────────
+        ext = os.path.splitext(rel_path)[1].lower()
 
-        # ── Insert documents row with status='vectorizing' ───────────────────
-        ts = _now_iso()
+        # ── Insert documents row (BLOB stored, status='vectorizing') ─────────
+        # insert_document first removes any existing doc at this path (including
+        # all its chunks/vectors) then inserts a fresh row -- clean re-ingest.
         try:
             with _db_lock:
-                cur = _db_conn.execute(
-                    "INSERT OR REPLACE INTO documents(path, status, ts) VALUES(?,?,?)",
-                    (rel_path, 'vectorizing', ts),
-                )
-                doc_id = cur.lastrowid
-                _db_conn.commit()
+                doc_id = _db_mod.insert_document(_db_conn, rel_path, file_bytes, ext)
         except Exception as e:
             self._json_response({'error': f'DB insert failed: {e}'}, 500,
                                 request_id=request_id)
@@ -1701,7 +1742,7 @@ class RagHandler(SimpleHTTPRequestHandler):
         # ── Kick off background ingestion ────────────────────────────────────
         t = threading.Thread(
             target=_ingest_background,
-            args=(doc_id, dest_path, rel_path, request_id),
+            args=(doc_id, rel_path, request_id),
             daemon=True,
         )
         t.start()
@@ -1725,18 +1766,21 @@ class RagHandler(SimpleHTTPRequestHandler):
         try:
             with _db_lock:
                 rows = _db_conn.execute(
-                    "SELECT path, status, n_chunks FROM documents ORDER BY path"
+                    "SELECT path, status, n_chunks, byte_size, ext "
+                    "FROM documents ORDER BY path"
                 ).fetchall()
         except Exception as e:
             self._json_response({'error': str(e)}, 500, request_id=request_id)
             return
 
         files = []
-        for path, status, n_chunks in rows:
+        for path, status, n_chunks, byte_size, ext in rows:
             files.append({
                 'path':        path,
                 'status':      status,
                 'chunk_count': n_chunks or 0,
+                'byte_size':   byte_size,
+                'ext':         ext,
             })
 
         self._json_response({'files': files}, 200, request_id=request_id)
@@ -2118,6 +2162,50 @@ class RagHandler(SimpleHTTPRequestHandler):
         self._json_response({'ok': True, 'deleted': deleted}, 200,
                             request_id=request_id)
 
+    def _handle_delete(self, body: bytes, request_id: str):
+        """POST /delete {"path": "..."} -- remove a document and all its data.
+
+        Calls db.delete_document which explicitly removes chunk_vecs,
+        chunk_vec_meta, chunks, and the documents row in that order (FK cascade
+        is not relied upon -- chunk_vecs is a vec0 virtual table and connect()
+        does not enable PRAGMA foreign_keys).
+
+        Returns {"ok": true, "deleted": <bool>, "path": <path>}.
+        Returns HTTP 404 with deleted=false when the path is not found.
+        """
+        ip = self.client_address[0]
+        try:
+            req = json.loads(body) if body else {}
+        except (json.JSONDecodeError, AttributeError):
+            self._json_response({'error': 'Invalid JSON body'}, 400,
+                                request_id=request_id)
+            return
+
+        path = (req.get('path') or '').strip()
+        if not path:
+            self._json_response({'error': '"path" required'}, 400,
+                                request_id=request_id)
+            return
+
+        if _db_conn is None:
+            self._json_response({'error': 'DB not initialised'}, 503,
+                                request_id=request_id)
+            return
+
+        try:
+            with _db_lock:
+                deleted = _db_mod.delete_document(_db_conn, path)
+        except Exception as e:
+            self._json_response({'error': str(e)}, 500, request_id=request_id)
+            return
+
+        log_event('delete_document', ip, 'POST', '/delete',
+                  request_id=request_id, doc_path=path, deleted=deleted)
+
+        status_code = 200 if deleted else 404
+        self._json_response({'ok': True, 'deleted': deleted, 'path': path},
+                            status_code, request_id=request_id)
+
     def _handle_shutdown(self, method, query, request_id):
         """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
         ip = self.client_address[0]
@@ -2463,7 +2551,6 @@ def main():
     # ── initialise the SQLite database (P1: init_db creates all tables) ───────
     print(f'[serve] opening rag.db at {db_path}', flush=True)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    os.makedirs(RAGDOCS_DIR, exist_ok=True)
     _db_conn = _db_mod.init_db(db_path)
     print('[serve] rag.db ready', flush=True)
 

@@ -99,10 +99,11 @@ batches yield the embed gate. Expose debug endpoints on `serve.py`: `POST /embed
 
 ## P4 -- Ingestion pipeline (drop -> searchable)
 
-**Build.** `POST /ingest` (file upload): extract (P2) -> chunk (P2) -> embed via the
-embed gate (P3), batched + yielding -> store doc/chunks/vectors (P1). File status moves
-*vectorizing* -> *ready*. `GET /tree` lists the corpus; `GET /doc?path=` previews text.
-Files land under `ragdocs/`.
+**Build.** `POST /ingest` (file upload): store the raw bytes as a **blob in `rag.db`**
+(no `ragdocs/` directory) -> extract (P2) -> chunk (P2) -> embed via the embed gate (P3),
+batched + yielding -> store chunks/vectors (P1). Status moves *vectorizing* -> *ready*.
+`GET /tree` lists the corpus; `GET /doc?path=` previews text; `POST /delete {path}`
+removes a document and cascades its chunks/vectors.
 
 **Test.** `curl -F file=@samples/notes.md localhost:51548/ingest` -> 200; poll
 `GET /tree` until the file shows *ready* with N chunks; `GET /doc?path=notes.md` returns

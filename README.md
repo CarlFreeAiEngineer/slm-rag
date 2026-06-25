@@ -32,21 +32,24 @@ better at using it.**
 
 | Left -- file tree | Right -- chat |
 |-------------------|---------------|
-| Your ingested documents, in folders. **Drag a file in** to add it. Each file shows its status: *vectorizing* -> *ready*. Click a file to preview it. | Ask questions; answers stream back grounded in your files, each with **citations** (which file + chunk it used, click to jump to the source). A *"this is wrong -> fix it"* control on any answer captures a training example. |
+| Your ingested documents, in folders. **Drag a file in** to add it (it's stored as a blob in `rag.db`, not a loose file). Each file shows its status: *vectorizing* -> *ready*. Click a file to preview it; **trash it to delete** the document and its chunks. | Ask questions; answers stream back grounded in your files, each with **citations** (which file + chunk it used, click to jump to the source). A *"this is wrong -> fix it"* control on any answer captures a training example. |
 
 ---
 
 ## How it works
 
 ### Ingestion (drop -> searchable)
-1. **Drop / upload** a file into the tree. Supported in v1: **`.txt`, `.md`, `.pdf`**
+1. **Drop / upload** a file into the tree. The raw bytes are stored as a **blob in
+   `rag.db`** -- there is no `ragdocs/` directory, so status, content, and deletion all
+   live in one row (no OS file locking). Supported in v1: **`.txt`, `.md`, `.pdf`**
    (PDF text via `pypdf`). More types later.
-2. **Extract** plain text, **chunk** it (~512 tokens with ~64-token overlap), and
-   **embed** each chunk with **nomic-embed-text v1.5** (768-dim) running as a small
-   GGUF on the bundled `llama.cpp`.
-3. **Store** the document, its chunks, and their vectors in **one SQLite file** using
+2. **Extract** plain text from the stored blob, **chunk** it (~512 tokens with ~64-token
+   overlap), and **embed** each chunk with **nomic-embed-text v1.5** (768-dim) running as
+   a small GGUF on the bundled `llama.cpp`.
+3. **Store** the document blob, its chunks, and their vectors in **one SQLite file** using
    the [`sqlite-vec`](https://github.com/asg017/sqlite-vec) extension (a `vec0` virtual
-   table). Ingestion and retrieval live in the same file -- nothing else to run.
+   table). The whole corpus is one portable file -- nothing else to run, and deleting a
+   document is a single cascading delete.
 
 ### Retrieval + answer
 1. The question is embedded with the same model.
@@ -240,8 +243,7 @@ slm-rag/
   index.html            # file-tree + chat UI (static, served by serve.py)
   run.bat / run.sh      # portable launchers (bundled uv)
   bin/                  # bundled uv.* and llama.cpp
-  ragdocs/              # ingested source files (the file tree) -- your corpus  (git-ignored)
-  rag.db                # SQLite system of record: docs, chunks, vec0 embeddings,
+  rag.db                # SQLite system of record: document blobs, chunks, vec0 embeddings,
                         #   chat transcript, request queue, model state, corrections  (git-ignored)
   logs/                 # hourly JSONL audit trail: http + inference req/resp, by session id  (git-ignored)
   training/
