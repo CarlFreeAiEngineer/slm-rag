@@ -203,9 +203,8 @@ needed, not a running server).
 
 ## P11 -- Staleness refresh & model pickup
 
-**Build.** The HF staleness check (size + sha256 sidecar, merv's pattern): on restart,
-re-fetch any weights whose HF copy changed, so a freshly fine-tuned Phi is served after a
-restart.
+**Build.** The HF staleness check (size + sha256 sidecar): on restart, re-fetch any
+weights whose HF copy changed, so a freshly fine-tuned Phi is served after a restart.
 
 **Test.** Point Phi at an updated HF file (or simulate a changed sha), restart, assert
 the new weights download and serve (the served model's hash/id changes). With the network

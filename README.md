@@ -9,9 +9,9 @@ The whole thing is **self-contained and portable**: a bundled `uv`, a bundled
 `llama.cpp`, and a single SQLite file hold the app, the models, the documents, and the
 vector index. No system installs, no database server, no cloud at inference time.
 
-It is a sibling of [`merv`](../merv) and reuses its proven pattern -- one `serve.py`
-running a static UI plus local `llama-server` backends, with weights auto-downloaded
-from Hugging Face on first run.
+The architecture is deliberately small: one `serve.py` runs a static UI plus local
+`llama-server` backends, with weights auto-downloaded from Hugging Face on first run.
+One file you can read top to bottom; nothing hidden behind a framework.
 
 ---
 
@@ -21,10 +21,10 @@ Start with an **uncustomized** Phi-4-mini and good retrieval. That alone answers
 of questions well. Where it falls short -- ignores the context, rambles, fails to say
 "I don't know," or formats poorly -- you flag the answer and write the version you
 wanted. Those `(question, retrieved-context, good-answer)` examples accumulate into a
-training set, and you periodically fine-tune Phi on them (on Colab, with the same
-Hugging Face and Colab accounts used for `merv`). The fine-tuned model is uploaded to
-Hugging Face and `serve.py` picks it up on the next restart. **Retrieval stays the
-same; the model gets better at using it.**
+training set, and you periodically fine-tune Phi on them (on Colab, with your own
+Hugging Face and Colab accounts). The fine-tuned model is uploaded to Hugging Face and
+`serve.py` picks it up on the next restart. **Retrieval stays the same; the model gets
+better at using it.**
 
 ---
 
@@ -58,10 +58,10 @@ same; the model gets better at using it.**
 
 ### Serving: two gates (vector + language)
 
-merv funnels all model access through **one** gate (a single worker), because it swaps
-one model in and out of a single slot. slm-rag keeps **both** models resident, so it
-uses **two independent gates**, one per model -- the same "single-file the model access"
-idea, doubled:
+Both models stay resident at once, so slm-rag serializes each one **independently** --
+**two gates**, one per model. Funneling everything through a single gate would make a
+dropped file block chat (and vice versa); two gates let the embedder and the generator
+work at the same time:
 
 - **Embed gate** -- serializes the **vector model** (CPU-pinned). Two callers share it:
   **ingestion** (embedding a dropped file's chunks) and **retrieval** (embedding the
@@ -80,10 +80,10 @@ time**. That overlap is the whole point of two gates instead of one.
 **CPU/GPU split.** The vector model runs **CPU-only** (`--n-gpu-layers 0`): it is ~140 MB
 and embedding is a single forward pass (no autoregressive decode), so CPU is plenty fast,
 and it leaves **all** VRAM to Phi (weights + KV cache). The language model takes the GPU
-when it fits and falls back to CPU otherwise (merv's per-model rule, applied to the one
-model that benefits from it).
+when it fits and falls back to CPU otherwise -- the only model that benefits from the GPU
+gets it.
 
-### Improvement loop (same shape as merv)
+### Improvement loop
 1. Flag a bad answer and supply the correct one. The app saves
    `(question, retrieved context, corrected answer)` to **SQLite** (exported to the
    `training/rag_finetune.csv` file when you fine-tune).
@@ -108,9 +108,9 @@ model that benefits from it).
 - **nomic-embed-text v1.5 for embeddings** *(Apache 2.0)*. Strong retrieval quality, small
   (~140 MB GGUF), and runs through the same `llama.cpp` we already bundle -- no separate
   Python embedding stack.
-- **Reuse merv's portable runtime.** Bundled `uv` + `llama.cpp`, `run.bat`/`run.sh`,
+- **A self-contained portable runtime.** Bundled `uv` + `llama.cpp`, `run.bat`/`run.sh`,
   HF auto-download, static UI served by `serve.py`. Two tiny `llama-server` instances
-  run side by side: one for Phi (chat), one for the embedder.
+  run side by side: one for Phi (chat), one for the embedder. No global install step.
 
 ---
 
@@ -135,16 +135,15 @@ start as soon as the embedder is ready), then serves the UI. Open
 | 52851 | `llama-server` -- Phi-4-mini (generation) |
 | 52852 | `llama-server` -- nomic-embed-text (embeddings) |
 
-**The llama.cpp backend differs per OS** (same approach as merv). Windows has no
-clean package path, so the one binary we bundle is the prebuilt `llama-server.exe`
-(CUDA build) under `bin/llama.cpp/`; **macOS** uses the system `llama-server` from
-`brew install llama.cpp` (Metal GPU); **Linux** ships no server binary -- the
-`llama-cpp-python` wheel (a Linux-only inline dep) has llama.cpp compiled in and runs
-in-process. Unlike merv (one model at a time), slm-rag keeps **two** models loaded at
-once (generation + embeddings): on Windows/macOS that's two `llama-server` instances
+**The llama.cpp backend differs per OS.** Windows has no clean package path, so the one
+binary we bundle is the prebuilt `llama-server.exe` (CUDA build) under `bin/llama.cpp/`;
+**macOS** uses the system `llama-server` from `brew install llama.cpp` (Metal GPU);
+**Linux** ships no server binary -- the `llama-cpp-python` wheel (a Linux-only inline
+dep) has llama.cpp compiled in and runs in-process. slm-rag keeps **two** models loaded
+at once (generation + embeddings): on Windows/macOS that's two `llama-server` instances
 on the two ports above; on Linux both load in-process via `llama-cpp-python`.
 
-### Command-line chat (same pattern as merv)
+### Command-line chat
 
 By default `serve.py` runs **web-only**. Pass `--cli` to also drop into a **terminal
 chat** alongside the web UI -- ask a question, get the grounded answer with its
@@ -167,9 +166,8 @@ the web UI too), `/help` lists commands, `/quit` exits. There is no `/model` swi
 slm-rag serves a single model.
 
 **Configuration is command-line only.** Every setting has a sensible default baked in
-and a `--flag` to override it -- there are **no environment variables** (this is a
-deliberate departure from merv, which reads `MERV_PORT`, `MERV_HOST`, `MERV_THREADS`,
-etc.). If a new knob is needed, add a flag with a default, not an env var.
+and a `--flag` to override it -- there are **no environment variables**. If a new knob is
+needed, add a flag with a default, not an env var.
 
 ### Everything is testable from the command line
 
@@ -194,7 +192,7 @@ Two tiers, on purpose:
   browser and the `--cli` repaint themselves purely by **reading** SQLite, so there is
   no per-client state to keep in sync and the whole app's state travels in one file.
 
-- **`./logs/` is the append-only audit trail (same shape as merv).** One JSON object per
+- **`./logs/` is the append-only audit trail.** One JSON object per
   line (JSONL), in hourly-rotated UTC files (`YYYY-MM-DD-HHZ.log`), written under a lock.
   We record the **request and the response as separate lines**, for **both** the HTTP
   API and each inference call. Every line carries **two correlation IDs**:
@@ -222,7 +220,7 @@ Two tiers, on purpose:
   record and the raw `./logs/` blow-by-blow **cross-reference each other by the same
   ids**. Queryable truth in SQLite; full request/response bodies in `./logs/`.
 
-### Shutdown (same strategy as merv)
+### Shutdown
 
 `serve.py` installs `SIGINT`/`SIGTERM` handlers that **stop both `llama-server`
 subprocesses** (terminate, then kill on timeout) before exiting, so Ctrl-C never leaves
@@ -241,7 +239,7 @@ slm-rag/
   serve.py              # HTTP server, RAG pipeline, SQLite/sqlite-vec, llama backends
   index.html            # file-tree + chat UI (static, served by serve.py)
   run.bat / run.sh      # portable launchers (bundled uv)
-  bin/                  # bundled uv.* and llama.cpp (shared pattern with merv)
+  bin/                  # bundled uv.* and llama.cpp
   ragdocs/              # ingested source files (the file tree) -- your corpus  (git-ignored)
   rag.db                # SQLite system of record: docs, chunks, vec0 embeddings,
                         #   chat transcript, request queue, model state, corrections  (git-ignored)
@@ -267,8 +265,8 @@ SQLite/sqlite-vec store (P1) and the text-extraction/chunking module (P2).
   retrieval vs generation failures and decide what to add to the training set.
 - **Embeddings are versioned.** If the embedding model changes, stored vectors must be
   rebuilt -- the schema records which embedder produced each vector.
-- **Portable by construction.** Like merv, everything needed is bundled or
-  auto-fetched; there is no global install step.
+- **Portable by construction.** Everything needed is bundled or auto-fetched; there is
+  no global install step.
 - **Content moderation -- nice-to-have, not built.** A third small "moderator" model
   (CPU-only, slotting in as a **moderation gate** beside the embed and gen gates -- one
   gate, two callers, just as the embed gate already serves both ingestion and retrieval)
