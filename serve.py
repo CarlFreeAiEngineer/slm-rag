@@ -113,15 +113,23 @@ DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
 # The model is instructed to cite chunks by number, e.g. [1] or [2][3].
 # The "I don't know" phrase is fixed so tests can match it reliably.
 #
+# DESIGN (chosen from the Colab model x prompt eval, 2025-06):
+#   The full grounding instruction lives ONLY in SYSTEM_PROMPT.  The user
+#   turn carries numbered chunks + bare "Question: ..." with NO repeated
+#   footer.  The eval showed that a redundant instruction footer caused
+#   over-refusal on answers stated in narrative/dialogue; moving it
+#   exclusively to the system message fixes this while preserving correct
+#   "I don't know" behaviour on genuinely out-of-corpus questions.
+#
 # NOTE: This prompt format MUST stay in sync with training/finetune_phi_rag.ipynb.
 ##############################################################################
 
 SYSTEM_PROMPT = (
-    "You are a precise document-grounded assistant. "
-    "Answer the user's question using ONLY the information in the numbered data chunks below. "
-    "Do not use any outside knowledge. "
-    "Cite the chunks you use by their number in square brackets, e.g. [1] or [2][3]. "
-    "If the answer is not present in the provided chunks, reply with exactly: "
+    "You answer using ONLY the numbered chunks below. "
+    "The answer may be stated indirectly, in narration or dialogue -- extract it and state it plainly "
+    "in 1-3 sentences in your own words. "
+    "Cite the chunk number(s) you used like [1] or [2][3]. "
+    "Only if none of the chunks are relevant, reply with exactly: "
     "\"I don't know based on the provided documents.\""
 )
 
@@ -140,6 +148,13 @@ def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
     Context chunks are numbered [1]..[N] in retrieval order (most relevant first).
     The model cites chunks by number (e.g. [1] or [2][3]).
 
+    DESIGN: The full grounding instruction lives in SYSTEM_PROMPT only.  The
+    user turn contains numbered chunks + bare "Question: ..." with NO repeated
+    footer.  This was chosen from the Colab model x prompt eval (2025-06):
+    placing the instruction solely in the system message fixes over-refusal on
+    answers stated in narrative/dialogue while preserving correct "I don't know"
+    behaviour on genuinely out-of-corpus questions.
+
     NOTE: This format MUST stay in sync with training/finetune_phi_rag.ipynb.
 
     Parameters
@@ -154,8 +169,8 @@ def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
     Returns
     -------
     The string to use as the 'user' role content in the chat completion request.
-    Numbered chunks appear first ([1] = most relevant), then the Question line,
-    then the instruction line.
+    Numbered chunks appear first ([1] = most relevant), then the bare Question
+    line.  No instruction footer -- the instruction lives solely in SYSTEM_PROMPT.
     """
     # Build numbered context chunks: [1] = most relevant (retrieval order).
     chunk_lines = []
@@ -180,18 +195,12 @@ def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
             lines.append(f"{prefix}: {content}")
         history_block = '\n'.join(lines) + '\n\n'
 
-    instruction = (
-        "Answer using ONLY the numbered chunks above. "
-        "Cite by number, e.g. [1] or [2][3]. "
-        "If the answer is not in the chunks, say exactly: "
-        "\"I don't know based on the provided documents.\""
-    )
-
+    # User content: history (if any) + numbered chunks + bare question.
+    # No instruction footer -- the instruction lives solely in SYSTEM_PROMPT.
     return (
         f"{history_block}"
         f"{context_block}\n\n"
-        f"Question: {question}\n\n"
-        f"{instruction}"
+        f"Question: {question}"
     )
 
 
@@ -201,7 +210,7 @@ def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) ->
     Pieces (in order):
       1. History block (if any) -- one piece
       2. Each numbered chunk [1]..[N] -- one piece per chunk
-      3. Question + instruction footer -- one piece
+      3. Bare question -- one piece (no instruction footer; instruction is in SYSTEM_PROMPT)
 
     The caller streams these into the DB one by one with a small sleep between
     pieces so the browser sees the prompt build up visually.
@@ -225,14 +234,8 @@ def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) ->
             f"[{i}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}\n\n"
         )
 
-    # Question + instruction footer
-    instruction = (
-        "Answer using ONLY the numbered chunks above. "
-        "Cite by number, e.g. [1] or [2][3]. "
-        "If the answer is not in the chunks, say exactly: "
-        "\"I don't know based on the provided documents.\""
-    )
-    pieces.append(f"Question: {question}\n\n{instruction}")
+    # Bare question -- no instruction footer (instruction lives solely in SYSTEM_PROMPT).
+    pieces.append(f"Question: {question}")
 
     return pieces
 

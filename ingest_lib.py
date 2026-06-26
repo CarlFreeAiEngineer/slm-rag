@@ -18,8 +18,13 @@ extract_text(path) -> str
     Read supported files (.txt, .md, .pdf) and return plain UTF-8 text.
     Raises ValueError for unsupported extensions.
 
-chunk_text(text, target_tokens=512, overlap_tokens=64) -> list[dict]
-    Split text into overlapping chunks.  Each dict has:
+chunk_text(text, target_chars=2200, overlap_paras=1) -> list[dict]
+    Paragraph-aware chunker (~2200 chars + 1-para overlap).
+    Chosen from the Colab A100 chunking sweep: keeps dialogue/Q&A exchanges
+    intact so the small model can extract an answer stated indirectly,
+    while keeping retrieval discrimination sharp.
+
+    Each dict has:
         chunk_index : int   -- 0-based position in the chunk sequence
         text        : str   -- the chunk's text content
         char_start  : int   -- byte offset of the first character in the
@@ -30,38 +35,15 @@ chunk_text(text, target_tokens=512, overlap_tokens=64) -> list[dict]
 
 ingest_file(path) -> list[dict]
     extract_text + chunk_text, with 'source_path' added to every chunk.
-
-Token heuristic
----------------
-We approximate token count as  len(word_list) * 4 // 3  where word_list is
-str.split() tokens (whitespace-split words).  The factor 4/3 accounts for
-sub-word tokenisation: most tokenisers produce ~1.33 tokens per word on
-English prose (empirically 1.2 – 1.5).  This is a deliberate approximation;
-the exact count depends on the final tokeniser, which is not available here.
-The heuristic keeps chunk sizes within ±20 % of the target on typical English
-text and is documented in the chunk dicts so callers can see what was used.
 """
 
 from __future__ import annotations
 
 import io
+import re
 import sys
 from pathlib import Path
 from typing import Any
-
-
-# ---------------------------------------------------------------------------
-# Token heuristic
-# ---------------------------------------------------------------------------
-
-def _words_to_tokens(n_words: int) -> int:
-    """Approximate token count from word count (4/3 factor for sub-word splits)."""
-    return n_words * 4 // 3
-
-
-def _tokens_to_words(n_tokens: int) -> int:
-    """Approximate word count from token count (inverse of 4/3 factor)."""
-    return n_tokens * 3 // 4
 
 
 # ---------------------------------------------------------------------------
@@ -146,108 +128,179 @@ def extract_text(path: str | Path) -> str:
 
 def chunk_text(
     text: str,
-    target_tokens: int = 512,
-    overlap_tokens: int = 64,
+    target_chars: int = 2200,
+    overlap_paras: int = 1,
 ) -> list[dict[str, Any]]:
     """
-    Split *text* into overlapping chunks of approximately *target_tokens* tokens.
+    Paragraph-aware chunker: ~2200 chars + 1-para overlap.
+
+    Chosen from the Colab A100 chunking sweep (2025-06): keeping whole
+    paragraphs together preserves dialogue / Q&A exchanges so the small
+    model can extract an answer stated indirectly, while keeping chunks
+    short enough (< 2048 embedder tokens) for sharp retrieval.
 
     Strategy
     --------
-    1. Split the full text into words (str.split()).
-    2. Convert token targets to word targets using the 4/3 heuristic.
-    3. Walk through the word list with a stride of (target_words - overlap_words),
-       collecting slices of target_words words.
-    4. For each word-slice, recover the exact char_start / char_end offsets from
-       the original text by locating the first and last word within the text.
-
-    The char offsets satisfy:
-        text[chunk["char_start"] : chunk["char_end"]] == chunk["text"]
+    1. Split the full text on blank-line paragraph boundaries
+       (re.split(r'\\n\\s*\\n', text)).
+    2. Greedily accumulate consecutive paragraphs until the accumulated
+       length >= target_chars, then emit a chunk.  Carry the last
+       *overlap_paras* paragraphs forward into the next chunk.
+    3. If a single paragraph alone exceeds ~1.5 * target_chars (3300 chars
+       by default), sentence-split THAT paragraph (regex ``(?<=[.!?])\\s+``)
+       and pack its sentences to the target so no chunk is enormous.
+    4. Track exact char_start / char_end offsets into the original *text*
+       so that ``text[chunk["char_start"] : chunk["char_end"]] == chunk["text"]``.
 
     Parameters
     ----------
     text          : the full document text
-    target_tokens : desired chunk size in (approximate) tokens  (default 512)
-    overlap_tokens: overlap between consecutive chunks, in tokens (default 64)
+    target_chars  : target chunk length in characters (default 2200,
+                    ~500-600 tokens on typical English prose)
+    overlap_paras : number of tail paragraphs carried into the next chunk
+                    as overlap (default 1)
 
     Returns
     -------
     List of dicts with keys: chunk_index, text, char_start, char_end.
-    Returns an empty list if *text* is empty.
+    Returns an empty list if *text* is empty or whitespace-only.
     """
     if not text.strip():
         return []
 
-    # Convert token targets to word targets using the heuristic.
-    target_words = _tokens_to_words(target_tokens)   # ~384 words for 512 tokens
-    overlap_words = _tokens_to_words(overlap_tokens)  # ~48 words for 64 tokens
-    stride = target_words - overlap_words             # non-overlapping advance
+    SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+    PARA_SPLIT     = re.compile(r'\n\s*\n')
+    MAX_PARA_CHARS = int(target_chars * 1.5)   # ~3300 chars -- split if exceeded
 
-    if stride <= 0:
-        raise ValueError(
-            f"overlap_tokens ({overlap_tokens}) must be smaller than "
-            f"target_tokens ({target_tokens})."
-        )
+    # ------------------------------------------------------------------ #
+    # Step 1: locate paragraph spans in the original text.               #
+    # We keep (start, end) offsets so we can reconstruct char positions. #
+    # ------------------------------------------------------------------ #
+    para_spans: list[tuple[int, int]] = []   # (char_start, char_end) per para
+    prev_end = 0
+    for m in PARA_SPLIT.finditer(text):
+        seg_start = prev_end
+        seg_end   = m.start()
+        para_text = text[seg_start:seg_end]
+        if para_text.strip():
+            # trim leading/trailing whitespace within the span
+            lstrip = len(para_text) - len(para_text.lstrip())
+            rstrip = len(para_text) - len(para_text.rstrip())
+            real_start = seg_start + lstrip
+            real_end   = seg_end   - rstrip
+            if real_start < real_end:
+                para_spans.append((real_start, real_end))
+        prev_end = m.end()
+    # Last paragraph (after final blank line, or the whole text if no blank lines)
+    tail = text[prev_end:]
+    if tail.strip():
+        lstrip = len(tail) - len(tail.lstrip())
+        rstrip = len(tail) - len(tail.rstrip())
+        real_start = prev_end + lstrip
+        real_end   = len(text) - rstrip
+        if real_start < real_end:
+            para_spans.append((real_start, real_end))
 
-    # Build a list of (word, char_start_in_text) pairs so we can recover
-    # byte offsets without a second pass.
-    words: list[str] = []
-    word_starts: list[int] = []   # char offset of each word's first character
-
-    pos = 0
-    for word in text.split(" "):
-        # text.split(" ") does NOT strip leading/trailing newlines inside words,
-        # but handles consecutive spaces correctly (empty strings for extra spaces).
-        # We iterate over lines to capture real starts.  Instead, use a manual scan:
-        pass
-
-    # More robust: scan the text character by character to locate each word.
-    # We define a "word" as a maximal non-whitespace run.
-    i = 0
-    n = len(text)
-    while i < n:
-        if not text[i].isspace():
-            start = i
-            while i < n and not text[i].isspace():
-                i += 1
-            words.append(text[start:i])
-            word_starts.append(start)
-        else:
-            i += 1
-
-    total_words = len(words)
-    if total_words == 0:
+    if not para_spans:
         return []
 
+    # ------------------------------------------------------------------ #
+    # Step 2: if any paragraph exceeds MAX_PARA_CHARS, sub-split it       #
+    # into sentence-packed spans so no chunk is enormous.                 #
+    # ------------------------------------------------------------------ #
+    def _sentence_spans(p_start: int, p_end: int) -> list[tuple[int, int]]:
+        """Break a large paragraph into sentence-packed sub-spans."""
+        para_text = text[p_start:p_end]
+        sentences = SENTENCE_SPLIT.split(para_text)
+        spans: list[tuple[int, int]] = []
+        bucket_start_in_para = 0
+        bucket_len = 0
+        bucket_first = 0   # index of first sentence in current bucket
+        # re-locate each sentence's start within para_text
+        sent_starts: list[int] = []
+        pos = 0
+        for s in sentences:
+            idx = para_text.find(s, pos)
+            sent_starts.append(idx)
+            pos = idx + len(s)
+
+        for si, s in enumerate(sentences):
+            s_len = len(s)
+            if bucket_len + s_len > target_chars and bucket_len > 0:
+                # emit current bucket
+                bs = p_start + sent_starts[bucket_first]
+                be = p_start + sent_starts[si - 1] + len(sentences[si - 1])
+                spans.append((bs, be))
+                bucket_first = si
+                bucket_len = 0
+            bucket_len += s_len + 1  # +1 for separator
+
+        # emit remaining
+        if bucket_first < len(sentences):
+            bs = p_start + sent_starts[bucket_first]
+            be = p_end
+            spans.append((bs, be))
+        return spans if spans else [(p_start, p_end)]
+
+    expanded: list[tuple[int, int]] = []
+    for ps, pe in para_spans:
+        if (pe - ps) > MAX_PARA_CHARS:
+            expanded.extend(_sentence_spans(ps, pe))
+        else:
+            expanded.append((ps, pe))
+
+    para_spans = expanded
+
+    # ------------------------------------------------------------------ #
+    # Step 3: greedily accumulate spans into chunks.                      #
+    # ------------------------------------------------------------------ #
     chunks: list[dict[str, Any]] = []
     chunk_index = 0
-    word_pos = 0  # start of current chunk in word list
+    i = 0
+    n_spans = len(para_spans)
 
-    while word_pos < total_words:
-        end_word = min(word_pos + target_words, total_words)
+    while i < n_spans:
+        acc_start = para_spans[i][0]
+        acc_end   = para_spans[i][1]
+        j = i + 1
+        while j < n_spans:
+            candidate_end = para_spans[j][1]
+            # include the gap between spans (whitespace) in the length count
+            accumulated = candidate_end - acc_start
+            if accumulated >= target_chars:
+                # include this span to hit/exceed the target, then stop
+                acc_end = candidate_end
+                j += 1
+                break
+            acc_end = candidate_end
+            j += 1
 
-        # char offsets: start of first word, end of last word in this slice
-        char_start = word_starts[word_pos]
-        last_word_start = word_starts[end_word - 1]
-        char_end = last_word_start + len(words[end_word - 1])
+        # Recover exact text (including any whitespace between paragraphs
+        # that fell inside the span range) -- just slice the original text.
+        chunk_str = text[acc_start:acc_end]
 
-        chunk_text_content = text[char_start:char_end]
+        # Re-trim leading/trailing whitespace for a clean chunk text, but
+        # keep the offsets pointing at the non-whitespace content.
+        lstrip = len(chunk_str) - len(chunk_str.lstrip())
+        rstrip = len(chunk_str) - len(chunk_str.rstrip())
+        real_cs = acc_start + lstrip
+        real_ce = acc_end   - rstrip
+        chunk_str = text[real_cs:real_ce]
 
-        chunks.append(
-            {
+        if chunk_str:
+            chunks.append({
                 "chunk_index": chunk_index,
-                "text": chunk_text_content,
-                "char_start": char_start,
-                "char_end": char_end,
-            }
-        )
+                "text":        chunk_str,
+                "char_start":  real_cs,
+                "char_end":    real_ce,
+            })
+            chunk_index += 1
 
-        chunk_index += 1
-
-        if end_word == total_words:
-            break  # final chunk consumed all remaining words
-
-        word_pos += stride
+        # Overlap: next chunk starts overlap_paras before j.
+        next_start = max(i + 1, j - overlap_paras)
+        if next_start <= i:
+            next_start = i + 1   # safety: always advance
+        i = next_start
 
     return chunks
 

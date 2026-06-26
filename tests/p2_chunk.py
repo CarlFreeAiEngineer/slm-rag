@@ -11,6 +11,10 @@ tests/p2_chunk.py -- Phase P2 acceptance test.
 Plain Python script; no pytest.  Prints what it checks; exits 0 on full
 pass, non-zero if any assertion fails.
 
+Tests the paragraph-aware chunk_text() introduced in the Colab A100 chunking
+sweep (2025-06): ~2200-char chunks + 1-para overlap, blank-line paragraph
+boundaries, sentence-split for oversized paragraphs.
+
 Run with:
     bin\\uv.exe run tests\\p2_chunk.py          (from the project root on Windows)
     bin/uv run tests/p2_chunk.py               (macOS / Linux)
@@ -61,37 +65,35 @@ def section(title: str) -> None:
 # ---------------------------------------------------------------------------
 # Known sentences placed deliberately in the sample files.
 #
-# sample.txt:  The sentence "The CAP theorem, formulated by Eric Brewer in
-#              2000, states that a distributed system cannot simultaneously
-#              provide all three" appears near the start of the 4th paragraph.
-#              With ~384 words per chunk it lands in chunk 1 (0-based).
+# With the paragraph-aware ~2200-char chunker, sample.txt's first chunk
+# covers the opening paragraphs including the CAP theorem paragraph, so
+# the known sentence lands in chunk 0.
 #
-# sample.md:   The sentence "K-means clustering partitions data into k
-#              clusters by iteratively" appears in the Unsupervised Learning
-#              section. With the same word-count window it lands in chunk 2.
+# sample.md: K-means paragraph follows multiple supervised-learning paragraphs
+# that together exceed 2200 chars, so K-means lands in chunk 1.
 # ---------------------------------------------------------------------------
 KNOWN_TXT_SENTENCE = (
     "The CAP theorem, formulated by Eric Brewer in 2000, states that a "
     "distributed system cannot simultaneously provide all three"
 )
-KNOWN_TXT_CHUNK = 1  # expected 0-based chunk index
+KNOWN_TXT_CHUNK = 0  # expected 0-based chunk index (paragraph-aware chunker)
 
 KNOWN_MD_SENTENCE = (
     "K-means clustering partitions data into k clusters by iteratively"
 )
-KNOWN_MD_CHUNK = 2  # expected 0-based chunk index
+KNOWN_MD_CHUNK = 1  # expected 0-based chunk index (paragraph-aware chunker)
 
-# Tolerance: chunk sizes (in approximate tokens) must be within this fraction
-# of the target.  20 % is generous but appropriate given the word-based heuristic.
-SIZE_TOLERANCE = 0.20
-TARGET_TOKENS = 512
-OVERLAP_TOKENS = 64
+# Paragraph-aware chunker targets ~2200 chars.  Chunks may vary somewhat
+# depending on paragraph boundaries; we check that the target is roughly met.
+TARGET_CHARS = 2200
+# Paragraph-aware chunks may be smaller when approaching document end;
+# only check that chunks at least 2 before the last are >= 50% of target.
+# This avoids false failures on short trailing paragraphs.
+TOLERANCE = 0.50   # chunks (excluding last 2) should be >= 50% of target_chars
 
-
-def approx_tokens(text: str) -> int:
-    """Mirror of ingest_lib._words_to_tokens for independent verification."""
-    n_words = len(text.split())
-    return n_words * 4 // 3
+# Minimum overlap in chars between consecutive chunks (1-para overlap).
+# One paragraph in sample.txt is typically 300-800 chars.
+MIN_OVERLAP_CHARS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +132,7 @@ def make_test_pdf(dest: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def test_txt(samples_dir: Path) -> None:
-    section("TXT sample -- ingest_file + chunk assertions")
+    section("TXT sample -- ingest_file + paragraph-aware chunk assertions")
     path = samples_dir / "sample.txt"
 
     check("sample.txt exists", path.exists(), str(path))
@@ -138,43 +140,26 @@ def test_txt(samples_dir: Path) -> None:
         return
 
     chunks = ingest_lib.ingest_file(path)
+    raw = ingest_lib.extract_text(path)
     n = len(chunks)
     check("multiple chunks produced", n > 1, f"got {n} chunks")
 
-    # --- chunk sizes within tolerance ---
-    low = int(TARGET_TOKENS * (1 - SIZE_TOLERANCE))
-    # Last chunk may be smaller; only check non-final chunks.
+    # --- chunk sizes: all but last 2 must be >= 50% of target_chars ---
+    # Paragraph-aware chunks may be small near the document end; only check
+    # chunks well before the end to avoid spurious failures.
+    low = int(TARGET_CHARS * TOLERANCE)
     bad_sizes = []
-    for c in chunks[:-1]:
-        approx = approx_tokens(c["text"])
-        if not (low <= approx <= int(TARGET_TOKENS * (1 + SIZE_TOLERANCE))):
-            bad_sizes.append((c["chunk_index"], approx))
+    for c in chunks[:-2]:
+        clen = c["char_end"] - c["char_start"]
+        if clen < low:
+            bad_sizes.append((c["chunk_index"], clen))
     check(
-        "non-final chunk sizes within tolerance",
+        f"chunks (excl. last 2) are >= {low} chars ({int(TOLERANCE*100)}% of target)",
         len(bad_sizes) == 0,
-        f"bad: {bad_sizes}" if bad_sizes else f"all within [{low}, {int(TARGET_TOKENS*(1+SIZE_TOLERANCE))}] approx-tokens",
-    )
-
-    # --- overlap between consecutive chunks ---
-    overlap_low = int(OVERLAP_TOKENS * (1 - SIZE_TOLERANCE))
-    bad_overlaps = []
-    for i in range(len(chunks) - 1):
-        a, b = chunks[i], chunks[i + 1]
-        # The overlap region is text[b.char_start : a.char_end]
-        overlap_len_chars = max(0, a["char_end"] - b["char_start"])
-        overlap_text = ingest_lib.extract_text(path)[b["char_start"]:a["char_end"]]
-        overlap_approx = approx_tokens(overlap_text)
-        if overlap_approx < overlap_low:
-            bad_overlaps.append((i, overlap_approx))
-    check(
-        "consecutive chunks overlap by ~overlap_tokens",
-        len(bad_overlaps) == 0,
-        f"bad pairs: {bad_overlaps}" if bad_overlaps
-        else f"all overlaps >= {overlap_low} approx-tokens",
+        f"bad: {bad_sizes}" if bad_sizes else f"all >= {low} chars",
     )
 
     # --- char_start / char_end monotonic and in-range ---
-    raw = ingest_lib.extract_text(path)
     rlen = len(raw)
     mono_ok = True
     inrange_ok = True
@@ -183,7 +168,6 @@ def test_txt(samples_dir: Path) -> None:
             inrange_ok = False
         if c["char_start"] >= c["char_end"]:
             mono_ok = False
-    # consecutive starts should be increasing
     for i in range(len(chunks) - 1):
         if chunks[i]["char_start"] >= chunks[i + 1]["char_start"]:
             mono_ok = False
@@ -202,13 +186,25 @@ def test_txt(samples_dir: Path) -> None:
         f"bad chunks: {bad_rt}" if bad_rt else "all chunks round-trip",
     )
 
+    # --- overlap: consecutive chunks share text (1-para overlap) ---
+    bad_overlaps = []
+    for i in range(len(chunks) - 1):
+        a, b = chunks[i], chunks[i + 1]
+        overlap_chars = max(0, a["char_end"] - b["char_start"])
+        if overlap_chars < MIN_OVERLAP_CHARS:
+            bad_overlaps.append((i, overlap_chars))
+    check(
+        f"consecutive chunks overlap by >= {MIN_OVERLAP_CHARS} chars (1-para overlap)",
+        len(bad_overlaps) == 0,
+        f"bad pairs: {bad_overlaps}" if bad_overlaps
+        else f"all overlaps >= {MIN_OVERLAP_CHARS} chars",
+    )
+
     # --- source_path set ---
     all_have_src = all("source_path" in c for c in chunks)
     check("source_path present on all chunks", all_have_src)
 
     # --- known sentence in expected chunk with correct offsets ---
-    # Find which chunk actually contains the known sentence (flexible check
-    # in case heuristic pushes it one chunk off from expected).
     containing = [c for c in chunks if KNOWN_TXT_SENTENCE in c["text"]]
     found = len(containing) > 0
     check(
@@ -231,7 +227,7 @@ def test_txt(samples_dir: Path) -> None:
 
 
 def test_md(samples_dir: Path) -> None:
-    section("MD sample -- ingest_file + chunk assertions")
+    section("MD sample -- ingest_file + paragraph-aware chunk assertions")
     path = samples_dir / "sample.md"
 
     check("sample.md exists", path.exists(), str(path))
@@ -245,35 +241,20 @@ def test_md(samples_dir: Path) -> None:
     raw = ingest_lib.extract_text(path)
     rlen = len(raw)
 
-    # --- chunk sizes within tolerance ---
-    low = int(TARGET_TOKENS * (1 - SIZE_TOLERANCE))
+    # --- chunk sizes: all but last 2 must be >= 50% of target_chars ---
+    low = int(TARGET_CHARS * TOLERANCE)
     bad_sizes = []
-    for c in chunks[:-1]:
-        approx = approx_tokens(c["text"])
-        if not (low <= approx <= int(TARGET_TOKENS * (1 + SIZE_TOLERANCE))):
-            bad_sizes.append((c["chunk_index"], approx))
+    for c in chunks[:-2]:
+        clen = c["char_end"] - c["char_start"]
+        if clen < low:
+            bad_sizes.append((c["chunk_index"], clen))
     check(
-        "non-final chunk sizes within tolerance",
+        f"chunks (excl. last 2) are >= {low} chars ({int(TOLERANCE*100)}% of target)",
         len(bad_sizes) == 0,
         f"bad: {bad_sizes}" if bad_sizes else "all within tolerance",
     )
 
-    # --- overlap between consecutive chunks ---
-    overlap_low = int(OVERLAP_TOKENS * (1 - SIZE_TOLERANCE))
-    bad_overlaps = []
-    for i in range(len(chunks) - 1):
-        a, b = chunks[i], chunks[i + 1]
-        overlap_text = raw[b["char_start"]:a["char_end"]]
-        overlap_approx = approx_tokens(overlap_text)
-        if overlap_approx < overlap_low:
-            bad_overlaps.append((i, overlap_approx))
-    check(
-        "consecutive chunks overlap by ~overlap_tokens",
-        len(bad_overlaps) == 0,
-        f"bad pairs: {bad_overlaps}" if bad_overlaps else "all overlaps OK",
-    )
-
-    # --- char_start monotonic and in-range ---
+    # --- char offsets in-range and monotonic ---
     mono_ok = True
     inrange_ok = True
     for c in chunks:
@@ -289,6 +270,19 @@ def test_md(samples_dir: Path) -> None:
     bad_rt = [c["chunk_index"] for c in chunks if raw[c["char_start"]:c["char_end"]] != c["text"]]
     check("text[char_start:char_end] recovers chunk text exactly", len(bad_rt) == 0,
           f"bad: {bad_rt}" if bad_rt else "all round-trip")
+
+    # --- overlap ---
+    bad_overlaps = []
+    for i in range(len(chunks) - 1):
+        a, b = chunks[i], chunks[i + 1]
+        overlap_chars = max(0, a["char_end"] - b["char_start"])
+        if overlap_chars < MIN_OVERLAP_CHARS:
+            bad_overlaps.append((i, overlap_chars))
+    check(
+        f"consecutive chunks overlap by >= {MIN_OVERLAP_CHARS} chars",
+        len(bad_overlaps) == 0,
+        f"bad pairs: {bad_overlaps}" if bad_overlaps else "all overlaps OK",
+    )
 
     # --- known sentence ---
     containing = [c for c in chunks if KNOWN_MD_SENTENCE in c["text"]]
@@ -337,11 +331,6 @@ def test_pdf(tmp_dir: Path) -> None:
         except Exception as exc:
             check("extract_text on PDF did not raise", False, str(exc))
     else:
-        # Dispatch-only test: verify extract_text routes .pdf correctly.
-        # We confirm it raises ImportError only if pypdf is absent, or runs
-        # without TypeError -- meaning the dispatch branch was reached.
-        # Since pypdf IS installed (declared in this script's deps), we
-        # expect it to run; we just won't have a real PDF file to parse.
         check(
             "PDF dispatch test skipped (reportlab unavailable)",
             True,
@@ -357,9 +346,6 @@ def test_unsupported_extension() -> None:
     except ValueError as exc:
         check("ValueError raised for .docx", True, str(exc))
     except FileNotFoundError:
-        # File doesn't exist -- dispatch happens before the existence check
-        # in some implementations; either ValueError or FileNotFoundError
-        # is acceptable as long as it does NOT silently succeed.
         check("error raised for .docx (FileNotFoundError also acceptable)", True,
               "FileNotFoundError -- file not found before type check")
     except Exception as exc:
@@ -367,34 +353,104 @@ def test_unsupported_extension() -> None:
 
 
 def test_chunk_text_unit() -> None:
-    """Unit tests for chunk_text() directly, independent of file I/O."""
-    section("chunk_text() unit tests")
+    """Unit tests for chunk_text() directly, independent of file I/O.
 
-    # Build a deterministic text: 800 unique words.
-    words = [f"word{i:04d}" for i in range(800)]
-    text = " ".join(words)
+    Tests the paragraph-aware chunker (target_chars=2200, overlap_paras=1).
+    """
+    section("chunk_text() unit tests -- paragraph-aware chunker")
 
-    chunks = ingest_lib.chunk_text(text, target_tokens=512, overlap_tokens=64)
-    check("unit: multiple chunks for 800 words", len(chunks) > 1, f"got {len(chunks)}")
+    # ------------------------------------------------------------------ #
+    # Test 1: multi-paragraph text produces multiple chunks + roundtrip   #
+    # ------------------------------------------------------------------ #
+    # Build text with ~10 paragraphs each ~350 chars (~3500 chars/para x 10).
+    # With target_chars=2200 we expect roughly 4-6 chunks on 10 paras.
+    paras = []
+    for i in range(10):
+        # Each paragraph is ~350 chars.
+        paras.append(
+            f"Paragraph {i}: " + " ".join(f"word{j:04d}" for j in range(50))
+        )
+    text = "\n\n".join(paras)
+
+    chunks = ingest_lib.chunk_text(text, target_chars=2200, overlap_paras=1)
+    check("unit: multiple chunks for 10 paragraphs", len(chunks) > 1, f"got {len(chunks)}")
 
     # All char offsets should recover the chunk text.
     bad_rt = [c["chunk_index"] for c in chunks if text[c["char_start"]:c["char_end"]] != c["text"]]
     check("unit: all chunks round-trip via char offsets", len(bad_rt) == 0,
           f"bad: {bad_rt}" if bad_rt else "ok")
 
-    # Empty text should return empty list.
+    # Overlap: consecutive chunks should overlap (1-para overlap).
+    bad_ovlp = []
+    for i in range(len(chunks) - 1):
+        a, b = chunks[i], chunks[i + 1]
+        overlap_chars = max(0, a["char_end"] - b["char_start"])
+        if overlap_chars < MIN_OVERLAP_CHARS:
+            bad_ovlp.append((i, overlap_chars))
+    check("unit: consecutive chunks overlap (1-para overlap)", len(bad_ovlp) == 0,
+          f"bad: {bad_ovlp}" if bad_ovlp else "ok")
+
+    # char_start strictly increasing
+    mono_ok = all(chunks[i]["char_start"] < chunks[i+1]["char_start"]
+                  for i in range(len(chunks)-1))
+    check("unit: char_start strictly increasing", mono_ok)
+
+    # ------------------------------------------------------------------ #
+    # Test 2: empty / whitespace-only text                                #
+    # ------------------------------------------------------------------ #
     empty = ingest_lib.chunk_text("")
     check("unit: empty text returns []", empty == [], f"got {empty}")
 
-    # Whitespace-only text should return empty list.
     ws = ingest_lib.chunk_text("   \n\t  ")
     check("unit: whitespace-only text returns []", ws == [], f"got {ws}")
 
-    # Single-word text should return exactly one chunk.
-    single = ingest_lib.chunk_text("hello")
-    check("unit: single word returns 1 chunk", len(single) == 1, f"got {len(single)}")
-    if single:
-        check("unit: single chunk round-trips", "hello"[single[0]["char_start"]:single[0]["char_end"]] == "hello")
+    # ------------------------------------------------------------------ #
+    # Test 3: single paragraph below target -> 1 chunk                   #
+    # ------------------------------------------------------------------ #
+    single_para = "Hello world. This is a short paragraph."
+    sp_chunks = ingest_lib.chunk_text(single_para)
+    check("unit: single short paragraph returns 1 chunk",
+          len(sp_chunks) == 1, f"got {len(sp_chunks)}")
+    if sp_chunks:
+        rt = single_para[sp_chunks[0]["char_start"]:sp_chunks[0]["char_end"]]
+        check("unit: single chunk round-trips", rt == sp_chunks[0]["text"],
+              repr(rt[:60]))
+
+    # ------------------------------------------------------------------ #
+    # Test 4: a known sentence lands in a chunk (and offsets are correct) #
+    # ------------------------------------------------------------------ #
+    MARKER = "The vampire asked the detective about the missing medallion."
+    doc = (
+        "Introduction paragraph with some filler text to pad it out.\n\n"
+        "Second paragraph, more filler text here to ensure we have enough words.\n\n"
+        f"{MARKER}  The detective replied that it had last been seen in Budapest.\n\n"
+        "Fourth paragraph wrapping up the story with a satisfying conclusion."
+    )
+    dc = ingest_lib.chunk_text(doc, target_chars=200, overlap_paras=1)
+    found = [c for c in dc if MARKER in c["text"]]
+    check("unit: known sentence lands in a chunk", len(found) > 0,
+          f"found in {[c['chunk_index'] for c in found]}" if found else "NOT FOUND")
+    if found:
+        c0 = found[0]
+        idx = c0["text"].find(MARKER)
+        abs_start = c0["char_start"] + idx
+        recovered = doc[abs_start: abs_start + len(MARKER)]
+        check("unit: known sentence offsets slice back from original",
+              recovered == MARKER, repr(recovered[:60]))
+
+    # ------------------------------------------------------------------ #
+    # Test 5: oversized single paragraph gets sentence-split              #
+    # ------------------------------------------------------------------ #
+    # Build a single paragraph > 1.5 * 200 = 300 chars with many sentences.
+    sentences = [f"Sentence number {k} ends here." for k in range(30)]
+    big_para = "  ".join(sentences)   # ~900 chars, no blank lines
+    bp_chunks = ingest_lib.chunk_text(big_para, target_chars=200, overlap_paras=1)
+    check("unit: oversized single paragraph is split into multiple chunks",
+          len(bp_chunks) > 1, f"got {len(bp_chunks)}")
+    bad_rt2 = [c["chunk_index"] for c in bp_chunks
+               if big_para[c["char_start"]:c["char_end"]] != c["text"]]
+    check("unit: sentence-split chunks round-trip", len(bad_rt2) == 0,
+          f"bad: {bad_rt2}" if bad_rt2 else "ok")
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +463,7 @@ def main() -> int:
 
     print("=" * 60)
     print("  slm-rag P2 -- text extraction + chunking tests")
+    print("  (paragraph-aware chunker, ~2200 chars + 1-para overlap)")
     print("=" * 60)
 
     test_txt(samples_dir)
