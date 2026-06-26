@@ -43,8 +43,8 @@ from urllib.error import URLError, HTTPError
 
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UV_EXE    = os.path.join(BASE_DIR, 'bin', 'uv.exe')
-if not os.path.isfile(UV_EXE):
-    UV_EXE = os.path.join(BASE_DIR, 'bin', 'uv')
+if os.name != 'nt':
+    UV_EXE = os.path.join(BASE_DIR, 'bin', 'uv.mac' if sys.platform == 'darwin' else 'uv.linux')
 
 SERVE_PY  = os.path.join(BASE_DIR, 'serve.py')
 SAMPLE_MD = os.path.join(BASE_DIR, 'samples', 'sample.md')

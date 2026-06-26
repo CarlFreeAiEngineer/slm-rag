@@ -32,8 +32,8 @@ from urllib.error import URLError, HTTPError
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UV_EXE   = os.path.join(BASE_DIR, 'bin', 'uv.exe')  # Windows
-if not os.path.isfile(UV_EXE):
-    UV_EXE = os.path.join(BASE_DIR, 'bin', 'uv')    # Linux / macOS
+if os.name != 'nt':
+    UV_EXE = os.path.join(BASE_DIR, 'bin', 'uv.mac' if sys.platform == 'darwin' else 'uv.linux')    # Linux / macOS
 
 SERVE_PY = os.path.join(BASE_DIR, 'serve.py')
 

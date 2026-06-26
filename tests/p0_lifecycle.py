@@ -35,6 +35,8 @@ from urllib.error import URLError
 # ── paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UV       = os.path.join(BASE_DIR, 'bin', 'uv.exe')
+if os.name != 'nt':
+    UV = os.path.join(BASE_DIR, 'bin', 'uv.mac' if sys.platform == 'darwin' else 'uv.linux')    # Linux / macOS
 SERVE    = os.path.join(BASE_DIR, 'serve.py')
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 
