@@ -1325,7 +1325,18 @@ def build_backends():
 
 
 def boot_backends():
-    """Boot both backends concurrently so the server is ready faster."""
+    """Boot both backends SEQUENTIALLY (embedder first, then Phi).
+
+    They must NOT be constructed concurrently.  On the Linux in-process path
+    (llama-cpp-python) two Llama() constructors racing in the same process
+    corrupt llama.cpp's global backend/CUDA init and the process dies with no
+    Python traceback -- we verified that the same load succeeds fine when run
+    alone, and that both models coexist happily once loaded; only simultaneous
+    construction crashes.  The Windows path (subprocess llama-server) doesn't
+    share that in-process state, but the weights are already on disk by now
+    (ensure_weights() ran in main()), so serial boot costs only a couple
+    seconds of construction time and is correct on both platforms.
+    """
     errors = []
 
     def _boot(b):
@@ -1336,12 +1347,8 @@ def boot_backends():
         except Exception as e:
             errors.append(str(e))
 
-    t_embed = threading.Thread(target=_boot, args=(_embed_backend,))
-    t_gen   = threading.Thread(target=_boot, args=(_gen_backend,))
-    t_embed.start()
-    t_gen.start()
-    t_embed.join()
-    t_gen.join()
+    _boot(_embed_backend)
+    _boot(_gen_backend)
 
     if errors:
         for e in errors:
