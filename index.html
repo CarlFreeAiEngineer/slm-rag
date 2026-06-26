@@ -566,10 +566,11 @@ let sessionId = null;        // minted on first enqueue, held until /clear
 let treePoller = null;       // setInterval handle for tree refresh
 let pendingRid  = null;      // request_id currently being polled
 let answerPoller = null;     // setInterval handle while polling for answer
+let _finishing  = false;     // guard so the answer is collapsed exactly once
 
 const TREE_POLL_MS      = 3000;
-const ANSWER_POLL_MS    = 3000;   // poll /history fast while streaming
-const HISTORY_POLL_MS   = 175;    // fast poll /history while message is streaming
+const ANSWER_POLL_MS    = 3000;   // backup /request poll (the fast history poll collapses first)
+const HISTORY_POLL_MS   = 175;    // fast poll /history: drives streaming AND collapses on done
 const ANSWER_TIMEOUT_MS = 12 * 60 * 1000;  // 12 min (model load + generation)
 
 // ── DOM refs ───────────────────────────────────────────────────
@@ -1032,7 +1033,39 @@ function _stopHistoryPoller() {
   }
 }
 
-// Start fast polling of /history to update the streaming bubble in real time.
+// Collapse the streaming bubble into the final cited answer, exactly once.
+// Driven by whichever poller sees the terminal status first (normally the fast
+// history poller). The server finalizes the message (answer + references) in the
+// SAME write that flips status to 'done', so the data is ready the instant we see
+// it -- no need to wait for the slower /request poll.
+//
+// `msgs` is the message list the caller already fetched: when present we render
+// the collapsed view straight from it -- NO second /history round-trip -- which is
+// what removes the pause between the last streamed char and the final form. The
+// backup /request poller has no message list, so it falls back to a fetch.
+async function _finishAnswer(sid, errMsg, msgs) {
+  if (_finishing || pendingRid === null) return;   // already collapsed
+  _finishing = true;
+  _stopHistoryPoller();
+  if (answerPoller) { clearInterval(answerPoller); answerPoller = null; }
+  pendingRid = null;
+  try {
+    if (errMsg) {
+      _removeStreamingBubble();
+      appendMessage('system', 'Generation error: ' + escapeHtml(errMsg));
+    } else if (msgs) {
+      _renderTranscript(msgs);     // collapse from data we already hold -- no refetch
+    } else {
+      await repaintHistory(sid);   // backup path: fetch, then render
+    }
+  } finally {
+    sendBtn.disabled = false;
+    _finishing = false;
+  }
+}
+
+// Start fast polling of /history to update the streaming bubble in real time,
+// and to collapse it the moment the message reaches a terminal status.
 function _startHistoryPoller(sid, rid) {
   _stopHistoryPoller();
   _historyPoller = setInterval(async () => {
@@ -1045,8 +1078,10 @@ function _startHistoryPoller(sid, rid) {
       const m = asst[asst.length - 1];
       if (m.status === 'streaming') {
         _updateStreamingBubble(m.content || '');
+      } else if (m.status === 'done') {
+        _finishAnswer(sid, null, msgs);   // collapse now, from data we already hold
       }
-      // If done/error, the main poller will handle collapse -- don't act here
+      // 'error' -> handled by the /request backup poller, which has the error text
     } catch (e) {
       // Ignore transient errors in history polling
     }
@@ -1058,41 +1093,47 @@ function _startHistoryPoller(sid, rid) {
 async function repaintHistory(sid) {
   try {
     const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
-    const msgs = json.messages || [];
-    // Clear existing conversation messages but keep the intro system message.
-    const systemMsg = chatMessages.querySelector('.msg-system');
-    chatMessages.innerHTML = '';
-    if (systemMsg) chatMessages.appendChild(systemMsg);
-    _streamingBubble = null;
-
-    let lastUserQuestion = '';
-    for (const m of msgs) {
-      if (m.role === 'user') {
-        lastUserQuestion = m.content || '';
-        appendMessage('user', escapeHtml(m.content || ''));
-      } else if (m.role === 'assistant') {
-        if (m.status === 'streaming') {
-          // Still building — show streaming build view
-          _startStreamingBubble();
-          _updateStreamingBubble(m.content || '');
-        } else {
-          // Done -- show collapsed view with footnotes
-          const answerText = m.answer || m.content || '';
-          let refs = [];
-          if (m.references) {
-            try { refs = JSON.parse(m.references); } catch {}
-          }
-          const msgEl = document.createElement('div');
-          msgEl.className = 'msg msg-assistant';
-          const collapsed = buildCollapsedBubble(answerText, refs, m.content, lastUserQuestion);
-          msgEl.appendChild(collapsed);
-          chatMessages.appendChild(msgEl);
-          chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-      }
-    }
+    _renderTranscript(json.messages || []);
   } catch (e) {
     console.error('history fetch error', e);
+  }
+}
+
+// Render a fetched transcript into the chat pane (synchronous; no network).
+// Split out of repaintHistory so the streaming poller can collapse straight from
+// the message list it already has, with no extra /history round-trip.
+function _renderTranscript(msgs) {
+  // Clear existing conversation messages but keep the intro system message.
+  const systemMsg = chatMessages.querySelector('.msg-system');
+  chatMessages.innerHTML = '';
+  if (systemMsg) chatMessages.appendChild(systemMsg);
+  _streamingBubble = null;
+
+  let lastUserQuestion = '';
+  for (const m of msgs) {
+    if (m.role === 'user') {
+      lastUserQuestion = m.content || '';
+      appendMessage('user', escapeHtml(m.content || ''));
+    } else if (m.role === 'assistant') {
+      if (m.status === 'streaming') {
+        // Still building — show streaming build view
+        _startStreamingBubble();
+        _updateStreamingBubble(m.content || '');
+      } else {
+        // Done -- show collapsed view with footnotes
+        const answerText = m.answer || m.content || '';
+        let refs = [];
+        if (m.references) {
+          try { refs = JSON.parse(m.references); } catch {}
+        }
+        const msgEl = document.createElement('div');
+        msgEl.className = 'msg msg-assistant';
+        const collapsed = buildCollapsedBubble(answerText, refs, m.content, lastUserQuestion);
+        msgEl.appendChild(collapsed);
+        chatMessages.appendChild(msgEl);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+    }
   }
 }
 
@@ -1159,18 +1200,9 @@ async function sendQuestion() {
       const { json: reqJson } = await apiFetch('GET', `/request?id=${encodeURIComponent(rid)}`);
       const status = reqJson.status;
       if (status === 'done' || status === 'error') {
-        clearInterval(answerPoller);
-        answerPoller = null;
-        pendingRid = null;
-        _stopHistoryPoller();
-        _removeStreamingBubble();
-        if (status === 'error') {
-          appendMessage('system', 'Generation error: ' + escapeHtml(reqJson.error || 'unknown'));
-        } else {
-          // Repaint the full conversation from server history (collapsed view)
-          await repaintHistory(sessionId);
-        }
-        sendBtn.disabled = false;
+        // Backup path: the fast history poller usually collapses first; whichever
+        // wins, _finishAnswer runs exactly once.
+        _finishAnswer(sessionId, status === 'error' ? (reqJson.error || 'unknown') : null);
       }
     } catch (e) {
       console.error('poll error', e);
