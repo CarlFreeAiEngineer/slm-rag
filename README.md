@@ -32,7 +32,7 @@ better at using it.**
 
 | Left -- file tree | Right -- chat |
 |-------------------|---------------|
-| Your ingested documents, in folders. **Drag a file in** to add it (it's stored as a blob in `rag.db`, not a loose file). Each file shows its status: *vectorizing* -> *ready*. Click a file to preview it; **trash it to delete** the document and its chunks. | Ask questions; answers stream back grounded in your files, each with **citations** (which file + chunk it used, click to jump to the source). A *"this is wrong -> fix it"* control on any answer captures a training example. |
+| Your ingested documents, in folders. **Drag a file in** to add it (it's stored as a blob in `rag.db`, not a loose file). Each file shows its status: *vectorizing* -> *ready*. Click a file to preview it; **trash it to delete** the document and its chunks. | Ask a question and **watch RAG happen**: the bubble first streams in the *exact prompt* being built -- the numbered data chunks `[1]..[N]` (most-relevant first), the question, and the instruction -- then the model's reply streams in token by token (the view auto-scrolls to follow). When it's done the bubble **collapses to just the answer**, with numbered **footnotes** `[1][2]` that pop open the cited chunk on click (and a *"show how this was built"* toggle to re-reveal the whole prompt). A *"this is wrong -> fix it"* control captures a training example. |
 
 ---
 

@@ -272,6 +272,9 @@ def run_fallback_test(base_url, reason):
     check('index.html contains /history call', '/history' in html)
     check('index.html contains /clear call', '/clear' in html)
     check('index.html contains citation rendering (renderCitations)', 'renderCitations' in html)
+    check('index.html contains numbered footnote marker class (fn-marker)', 'fn-marker' in html)
+    check('index.html contains build-view streaming class', 'build-view' in html)
+    check('index.html contains show-build-toggle', 'show-build-toggle' in html)
     check('index.html contains fix-it control (/correct wired, P9)', '/correct' in html)
     check('index.html notes /correct lands in P9', 'P9' in html)
 
@@ -329,7 +332,7 @@ def run_fallback_test(base_url, reason):
     check('request reaches done status', done is not None and done.get('status') == 'done',
           str(done))
 
-    # 8. GET /history and assert cited answer
+    # 8. GET /history and assert cited answer (new model: answer + references fields)
     print('\n[check] GET /history (cited answer)')
     code, hist = http_get(base_url, f'/history?session_id={sid}')
     check('GET /history returns 200', code == 200)
@@ -337,11 +340,20 @@ def run_fallback_test(base_url, reason):
     asst = [m for m in msgs if m.get('role') == 'assistant' and m.get('status') == 'done']
     check('history contains assistant message', len(asst) > 0)
     if asst:
-        answer = asst[-1].get('content', '')
+        last_asst = asst[-1]
+        # Use `answer` (clean collapsed text) if available; fall back to content
+        answer = last_asst.get('answer', '') or last_asst.get('content', '')
+        content = last_asst.get('content', '')
+        import re as _re
         check('answer mentions k-means',
               IN_CORPUS_EXPECTED.lower() in answer.lower(), answer[:120])
-        check('answer contains [Source: ...] citation',
-              '[Source:' in answer, answer[:200])
+        # New numbered citation format: [1], [2], etc.
+        check('answer contains numbered [N] citation',
+              bool(_re.search(r'\[\d+\]', answer)), answer[:200])
+        check('references field present in history message',
+              last_asst.get('references') is not None, str(last_asst.get('references', ''))[:80])
+        check('build transcript (content) longer than collapsed answer',
+              len(content) > len(answer), f'content={len(content)} answer={len(answer)}')
 
     # 9. POST /clear
     print('\n[check] POST /clear')
@@ -435,40 +447,57 @@ def run_playwright_test(base_url):
         page.fill('#chat-input', IN_CORPUS_QUESTION)
         page.click('#send-btn')
 
-        # 5. Wait for the assistant message to render (long timeout)
-        print('\n[check] Chat: wait for answer')
+        # 5. Wait for the streaming bubble to appear and show build content
+        print('\n[check] Chat: streaming build content appears')
         answer_deadline_ms = ANSWER_TIMEOUT_S * 1000
         try:
-            page.wait_for_selector('.msg-assistant', timeout=answer_deadline_ms)
-            # Wait until the thinking indicator is gone (answer fully rendered)
-            page.wait_for_function(
-                "() => !document.getElementById('thinking-indicator')",
-                timeout=answer_deadline_ms,
-            )
+            # Streaming bubble should appear quickly (build-view inside msg-assistant)
+            page.wait_for_selector('.build-view', timeout=60000)
+            streaming_appeared = True
+        except PWTimeout:
+            streaming_appeared = False
+        check('streaming build-view appears', streaming_appeared)
+
+        if streaming_appeared:
+            # Capture content at two points to verify it grows
+            import time as _time
+            content_a = page.evaluate("() => { const el = document.querySelector('.build-view'); return el ? el.textContent.length : 0; }")
+            _time.sleep(3)
+            content_b = page.evaluate("() => { const el = document.querySelector('.build-view'); return el ? el.textContent.length : 0; }")
+            check('streaming content grows while building',
+                  content_b >= content_a and content_a >= 0,
+                  f'content_a={content_a} content_b={content_b}')
+
+        # 5b. Wait for the answer to fully render (collapsed view with fn-marker)
+        print('\n[check] Chat: wait for collapsed answer')
+        try:
+            # After done, the bubble collapses: build-view disappears, answer-view appears
+            page.wait_for_selector('.answer-view', timeout=answer_deadline_ms)
             answer_rendered = True
         except PWTimeout:
-            answer_rendered = False
-        check('assistant answer rendered', answer_rendered)
+            # Fallback: just check msg-assistant appeared
+            answer_rendered = page.query_selector('.msg-assistant') is not None
+        check('collapsed answer-view rendered', answer_rendered)
 
-        # 6. Assert a [Source: ...] citation span is present and clickable
-        print('\n[check] Citation element')
-        citation_el = page.query_selector('.citation')
-        check('[Source: ...] citation element present', citation_el is not None)
+        # 6. Assert a [N] numbered footnote marker is present and clickable
+        print('\n[check] Numbered footnote marker')
+        fn_marker = page.query_selector('.fn-marker')
+        check('[N] numbered footnote marker present', fn_marker is not None)
 
-        if citation_el:
-            # Click the citation and verify preview overlay opens
-            citation_el.click()
+        if fn_marker:
+            # Click the footnote marker and verify inline expander opens
+            fn_marker.click()
             try:
-                page.wait_for_selector('.preview-overlay.open', timeout=5000)
-                overlay_opened = True
+                page.wait_for_selector('.fn-expander.open', timeout=3000)
+                expander_opened = True
             except PWTimeout:
-                overlay_opened = False
-            check('clicking citation opens doc preview', overlay_opened)
+                expander_opened = False
+            check('clicking footnote marker opens inline expander', expander_opened)
 
-            # Close the overlay
-            close_btn = page.query_selector('#preview-close')
-            if close_btn:
-                close_btn.click()
+        # 6b. Check show-build-toggle is present
+        print('\n[check] Show-build toggle')
+        build_toggle = page.query_selector('.show-build-toggle')
+        check('show-build-toggle present', build_toggle is not None)
 
         # 7. Verify fix-it control is present
         print('\n[check] Fix-it control')

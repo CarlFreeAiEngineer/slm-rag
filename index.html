@@ -271,6 +271,70 @@
       40%           { transform: scale(1);   opacity: 1;   }
     }
 
+    /* Streaming build view (prompt + token stream, monospace pre) */
+    .build-view {
+      font-family: 'Consolas', 'Menlo', monospace;
+      font-size: 0.78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #374151;
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+      padding: 0.5rem 0.7rem;
+      max-height: 320px;
+      overflow-y: auto;
+      line-height: 1.45;
+    }
+
+    /* Collapsed answer view */
+    .answer-view {
+      line-height: 1.55;
+    }
+
+    /* Footnote markers [1], [2] etc. inside collapsed answer */
+    .fn-marker {
+      display: inline;
+      color: #4338ca;
+      text-decoration: underline;
+      cursor: pointer;
+      font-size: 0.82em;
+      font-weight: 600;
+    }
+    .fn-marker:hover { color: #6366f1; }
+
+    /* Inline footnote expander */
+    .fn-expander {
+      display: none;
+      margin: 0.4rem 0 0.6rem 0;
+      padding: 0.5rem 0.7rem;
+      background: #eef2ff;
+      border-left: 3px solid #6366f1;
+      border-radius: 0 4px 4px 0;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #1e1b4b;
+    }
+    .fn-expander.open { display: block; }
+    .fn-expander .fn-source {
+      font-size: 0.72rem;
+      color: #6366f1;
+      margin-bottom: 0.3rem;
+      font-weight: 600;
+    }
+
+    /* Show/hide build toggle */
+    .show-build-toggle {
+      margin-top: 0.4rem;
+      font-size: 0.73rem;
+      color: #9ca3af;
+      cursor: pointer;
+      user-select: none;
+      display: inline-block;
+    }
+    .show-build-toggle:hover { color: #4b5563; }
+
     /* Fix-it control */
     .fix-it-ctrl {
       margin-top: 0.5rem;
@@ -503,8 +567,9 @@ let treePoller = null;       // setInterval handle for tree refresh
 let pendingRid  = null;      // request_id currently being polled
 let answerPoller = null;     // setInterval handle while polling for answer
 
-const TREE_POLL_MS    = 3000;
-const ANSWER_POLL_MS  = 3000;
+const TREE_POLL_MS      = 3000;
+const ANSWER_POLL_MS    = 3000;   // poll /history fast while streaming
+const HISTORY_POLL_MS   = 175;    // fast poll /history while message is streaming
 const ANSWER_TIMEOUT_MS = 12 * 60 * 1000;  // 12 min (model load + generation)
 
 // ── DOM refs ───────────────────────────────────────────────────
@@ -689,13 +754,11 @@ previewOverlay.addEventListener('click', e => {
   if (e.target === previewOverlay) previewOverlay.classList.remove('open');
 });
 
-// ── Citations ──────────────────────────────────────────────────
-// Citations have the form [Source: <path>, chunk <n>]
-// We render them as clickable spans that open the doc preview at that chunk.
+// ── Citations (legacy [Source: ...] format kept for backward compat) ──────
+// Also handles the new [N] numbered footnote format in collapsed answer view.
 
 function renderCitations(text) {
-  // Match [Source: <path>, chunk <n>]
-  // Path can contain spaces and punctuation but not ']'
+  // Match [Source: <path>, chunk <n>] -- legacy format
   return text.replace(/\[Source:\s*([^\],]+),\s*chunk\s*(\d+)\]/g,
     (match, path, chunkStr) => {
       const p = path.trim();
@@ -710,13 +773,112 @@ function attachCitationClicks(el) {
     span.addEventListener('click', () => {
       const path = span.dataset.path;
       const chunk = parseInt(span.dataset.chunk, 10);
-      // Highlight the cited file in the tree
       treeList.querySelectorAll('.tree-item').forEach(li => {
         li.classList.toggle('active', li.dataset.path === path);
       });
       openPreview(path, chunk);
     });
   });
+}
+
+// ── Numbered footnote rendering ────────────────────────────────
+// Render an answer that may contain [1], [2], [3] etc. as clickable footnote
+// markers.  Each click toggles an inline expander showing the chunk text and
+// source.  references is an array of {n, path, chunk_index, text} objects.
+
+function renderNumberedAnswer(answerText, references) {
+  // Build a lookup by number
+  const refMap = {};
+  (references || []).forEach(r => { refMap[r.n] = r; });
+
+  // Replace [N] patterns with clickable markers (but not [N] inside words)
+  const html = escapeHtml(answerText).replace(/\[(\d+)\]/g, (match, numStr) => {
+    const n = parseInt(numStr, 10);
+    const ref = refMap[n];
+    if (!ref) return escapeHtml(match);
+    return `<span class="fn-marker" data-fn="${n}" title="Source: ${escapeHtml(ref.path)}, chunk ${ref.chunk_index}">${escapeHtml(match)}</span>`;
+  });
+  return html;
+}
+
+function buildCollapsedBubble(answerText, references, buildContent, lastUserQuestion) {
+  // Container for the collapsed view
+  const wrap = document.createElement('div');
+  wrap.className = 'answer-view';
+
+  // Render the answer with numbered footnote markers
+  const answerDiv = document.createElement('div');
+  answerDiv.innerHTML = renderNumberedAnswer(answerText, references);
+  wrap.appendChild(answerDiv);
+
+  // Build inline expanders (hidden by default) -- one per unique ref number cited
+  const refMap = {};
+  (references || []).forEach(r => { refMap[r.n] = r; });
+
+  // Collect cited numbers from answer
+  const cited = new Set();
+  (answerText.match(/\[(\d+)\]/g) || []).forEach(m => {
+    cited.add(parseInt(m.slice(1, -1), 10));
+  });
+
+  cited.forEach(n => {
+    const ref = refMap[n];
+    if (!ref) return;
+    const expander = document.createElement('div');
+    expander.className = 'fn-expander';
+    expander.id = `fn-expander-${n}`;
+    const srcLine = document.createElement('div');
+    srcLine.className = 'fn-source';
+    srcLine.textContent = `[${n}] source: ${ref.path}, chunk ${ref.chunk_index}`;
+    expander.appendChild(srcLine);
+    const textNode = document.createTextNode(ref.text);
+    expander.appendChild(textNode);
+    wrap.appendChild(expander);
+  });
+
+  // Wire footnote marker clicks to toggle expanders
+  answerDiv.querySelectorAll('.fn-marker').forEach(marker => {
+    marker.addEventListener('click', () => {
+      const n = marker.dataset.fn;
+      const exp = document.getElementById('fn-expander-' + n);
+      if (exp) {
+        exp.classList.toggle('open');
+        // Also highlight the source file in the tree
+        const ref = refMap[parseInt(n, 10)];
+        if (ref) {
+          treeList.querySelectorAll('.tree-item').forEach(li => {
+            li.classList.toggle('active', li.dataset.path === ref.path);
+          });
+        }
+      }
+    });
+  });
+
+  // "show how this was built" toggle
+  if (buildContent) {
+    const toggle = document.createElement('div');
+    toggle.className = 'show-build-toggle';
+    toggle.textContent = '▸ show how this was built';
+    wrap.appendChild(toggle);
+
+    const buildView = document.createElement('div');
+    buildView.className = 'build-view';
+    buildView.style.display = 'none';
+    buildView.textContent = buildContent;
+    wrap.appendChild(buildView);
+
+    toggle.addEventListener('click', () => {
+      const open = buildView.style.display !== 'none';
+      buildView.style.display = open ? 'none' : 'block';
+      toggle.textContent = open ? '▸ show how this was built' : '▾ hide build details';
+    });
+  }
+
+  // Fix-it control
+  const fixIt = buildFixItControl(lastUserQuestion, answerText);
+  wrap.appendChild(fixIt);
+
+  return wrap;
 }
 
 // ── Chat ───────────────────────────────────────────────────────
@@ -819,6 +981,71 @@ function buildFixItControl(questionText, answerText) {
   return ctrl;
 }
 
+// ── Streaming assistant bubble ─────────────────────────────────
+// Manages a single live assistant bubble while a message is status='streaming'.
+// The bubble shows the raw build content (monospace pre) and auto-scrolls.
+
+let _streamingBubble = null;   // the current live .msg-assistant div
+let _streamingMsgId  = null;   // message id of the streaming row
+let _historyPoller   = null;   // fast /history poll while streaming
+
+function _startStreamingBubble() {
+  if (_streamingBubble) return;
+  const div = document.createElement('div');
+  div.className = 'msg msg-assistant';
+  div.id = 'streaming-bubble';
+  const buildView = document.createElement('div');
+  buildView.className = 'build-view';
+  buildView.id = 'streaming-build-view';
+  div.appendChild(buildView);
+  chatMessages.appendChild(div);
+  _streamingBubble = div;
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function _updateStreamingBubble(content) {
+  if (!_streamingBubble) _startStreamingBubble();
+  const bv = document.getElementById('streaming-build-view');
+  if (bv) bv.textContent = content;
+  // Auto-scroll so the user always sees the latest output
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function _removeStreamingBubble() {
+  if (_streamingBubble) {
+    _streamingBubble.remove();
+    _streamingBubble = null;
+  }
+}
+
+function _stopHistoryPoller() {
+  if (_historyPoller) {
+    clearInterval(_historyPoller);
+    _historyPoller = null;
+  }
+}
+
+// Start fast polling of /history to update the streaming bubble in real time.
+function _startHistoryPoller(sid, rid) {
+  _stopHistoryPoller();
+  _historyPoller = setInterval(async () => {
+    try {
+      const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
+      const msgs = json.messages || [];
+      // Find the assistant message that corresponds to the current request
+      const asst = msgs.filter(m => m.role === 'assistant' && m.request_id === rid);
+      if (asst.length === 0) return;
+      const m = asst[asst.length - 1];
+      if (m.status === 'streaming') {
+        _updateStreamingBubble(m.content || '');
+      }
+      // If done/error, the main poller will handle collapse -- don't act here
+    } catch (e) {
+      // Ignore transient errors in history polling
+    }
+  }, HISTORY_POLL_MS);
+}
+
 // Repaint the whole conversation from GET /history.
 // The transcript is server-side state — never maintained separately client-side.
 async function repaintHistory(sid) {
@@ -829,21 +1056,32 @@ async function repaintHistory(sid) {
     const systemMsg = chatMessages.querySelector('.msg-system');
     chatMessages.innerHTML = '';
     if (systemMsg) chatMessages.appendChild(systemMsg);
+    _streamingBubble = null;
 
-    // Track the last user question so we can associate it with the answer for fix-it.
     let lastUserQuestion = '';
     for (const m of msgs) {
       if (m.role === 'user') {
         lastUserQuestion = m.content || '';
         appendMessage('user', escapeHtml(m.content || ''));
       } else if (m.role === 'assistant') {
-        const rawContent = m.content || '';
-        const htmlContent = renderCitations(escapeHtml(rawContent));
-        const msgEl = appendMessage('assistant', htmlContent);
-        attachCitationClicks(msgEl);
-        // Attach fix-it control to every completed assistant message.
-        const fixIt = buildFixItControl(lastUserQuestion, rawContent);
-        msgEl.appendChild(fixIt);
+        if (m.status === 'streaming') {
+          // Still building — show streaming build view
+          _startStreamingBubble();
+          _updateStreamingBubble(m.content || '');
+        } else {
+          // Done -- show collapsed view with footnotes
+          const answerText = m.answer || m.content || '';
+          let refs = [];
+          if (m.references) {
+            try { refs = JSON.parse(m.references); } catch {}
+          }
+          const msgEl = document.createElement('div');
+          msgEl.className = 'msg msg-assistant';
+          const collapsed = buildCollapsedBubble(answerText, refs, m.content, lastUserQuestion);
+          msgEl.appendChild(collapsed);
+          chatMessages.appendChild(msgEl);
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
       }
     }
   } catch (e) {
@@ -889,6 +1127,11 @@ async function sendQuestion() {
     return;
   }
 
+  // Remove "thinking" dots and start streaming bubble + fast history poller
+  removeThinking();
+  _startStreamingBubble();
+  _startHistoryPoller(sid, rid);
+
   // Poll GET /request?id=<rid> until done or error
   pendingRid = rid;
   const deadline = Date.now() + ANSWER_TIMEOUT_MS;
@@ -899,7 +1142,8 @@ async function sendQuestion() {
       clearInterval(answerPoller);
       answerPoller = null;
       pendingRid = null;
-      removeThinking();
+      _stopHistoryPoller();
+      _removeStreamingBubble();
       appendMessage('system', 'Timed out waiting for answer.');
       sendBtn.disabled = false;
       return;
@@ -911,11 +1155,12 @@ async function sendQuestion() {
         clearInterval(answerPoller);
         answerPoller = null;
         pendingRid = null;
-        removeThinking();
+        _stopHistoryPoller();
+        _removeStreamingBubble();
         if (status === 'error') {
           appendMessage('system', 'Generation error: ' + escapeHtml(reqJson.error || 'unknown'));
         } else {
-          // Repaint the full conversation from server history
+          // Repaint the full conversation from server history (collapsed view)
           await repaintHistory(sessionId);
         }
         sendBtn.disabled = false;
@@ -950,6 +1195,7 @@ newChatBtn.addEventListener('click', async () => {
     }
   }
   sessionId = null;
+  _streamingBubble = null;
   // Clear the UI
   const systemMsg = chatMessages.querySelector('.msg-system');
   chatMessages.innerHTML = '';

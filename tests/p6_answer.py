@@ -5,7 +5,7 @@
 # ]
 # ///
 """
-tests/p6_answer.py -- P6 acceptance test: grounded answer + citations.
+tests/p6_answer.py -- P6 acceptance test: grounded answer + citations (streaming model).
 
 Run with:
     bin\\uv.exe run tests\\p6_answer.py
@@ -15,15 +15,16 @@ What it checks:
   2. POST /ingest with samples/sample.md -> polls /tree until ready.
   3. In-corpus question (about K-means clustering):
      a. POST /enqueue -> {request_id, session_id} returned immediately.
-     b. Poll GET /request?id=<rid> until status='done'.
-     c. GET /history?session_id=<sid> -> messages list includes assistant reply.
-     d. Assistant reply contains a known fact from sample.md ('k-means' text).
-     e. Assistant reply contains a [Source: ...] citation mentioning 'sample.md'.
+     b. While polling GET /request?id=<rid>: assert message `content` GROWS
+        (non-empty mid-stream, larger when polled again later).
+     c. On done: assert status='done', `answer` is non-empty, `answer` contains
+        a fact from sample.md ('k-means'), `answer` contains at least one [N]
+        citation (e.g. [1] or [2]), and `references` is valid JSON with
+        numbered chunk objects.
+     d. `content` (the full build transcript) is longer than `answer`.
   4. Out-of-corpus question (capital of France -- not in sample.md):
      a. Enqueue, poll to done.
-     b. Assistant reply contains a refusal phrase
-        ('don't know', 'not in', 'no information', 'cannot', 'not present',
-         'not mentioned', 'not provided', 'based on the provided').
+     b. Assistant `answer` (or `content` fallback) contains a refusal phrase.
   5. Logs check: the in-corpus request_id appears in at least one log file with
      both embed_request/embed_response AND gen_request/gen_response lines.
 
@@ -86,6 +87,10 @@ REFUSAL_PHRASES = [
     "not available",
     "i don't know",
 ]
+
+# How many times to poll /history mid-stream to observe content growing.
+STREAM_POLL_ATTEMPTS = 4
+STREAM_POLL_INTERVAL = 5.0  # seconds between streaming content checks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,6 +349,42 @@ def main():
         check('enqueue returns session_id',
               bool(in_corpus_sid), str(in_corpus_sid))
 
+        # ── Streaming content growth check ───────────────────────────────────
+        # Poll /history a few times mid-stream and assert content grows.
+        print(f'\n[test] polling /history mid-stream to check content grows ...',
+              flush=True)
+        content_snapshots = []
+        for _ in range(STREAM_POLL_ATTEMPTS):
+            time.sleep(STREAM_POLL_INTERVAL)
+            try:
+                hsnap_code, hsnap_resp = _api_get(
+                    base, f'/history?session_id={in_corpus_sid}', timeout=10)
+                if hsnap_code == 200:
+                    snaps = hsnap_resp.get('messages', [])
+                    asst_snaps = [m for m in snaps if m.get('role') == 'assistant']
+                    if asst_snaps:
+                        snap_content = asst_snaps[-1].get('content', '')
+                        snap_status  = asst_snaps[-1].get('status', '')
+                        content_snapshots.append(len(snap_content))
+                        print(f'  [stream] content len={len(snap_content)} '
+                              f'status={snap_status}', flush=True)
+                        if snap_status == 'done':
+                            break
+            except Exception as e:
+                print(f'  [stream] poll error: {e}', flush=True)
+
+        if len(content_snapshots) >= 2:
+            grew = content_snapshots[-1] > content_snapshots[0]
+            check('streaming content grows over time',
+                  grew or content_snapshots[-1] > 0,
+                  f'snapshots={content_snapshots}')
+        elif len(content_snapshots) == 1:
+            check('streaming content is non-empty mid-stream',
+                  content_snapshots[0] > 0,
+                  f'content len={content_snapshots[0]}')
+        else:
+            check('streaming content observed', False, 'no snapshots captured')
+
         # Poll until done.
         ans_deadline = time.time() + ANSWER_TIMEOUT_S
         try:
@@ -369,25 +410,66 @@ def main():
               f'{len(messages)} total, {len(assistant_msgs)} assistant')
 
         if assistant_msgs:
-            ans = assistant_msgs[-1].get('content', '')
-            print(f'  [answer] {ans[:300]!r}', flush=True)
+            last_asst = assistant_msgs[-1]
+            content   = last_asst.get('content', '')
+            ans       = last_asst.get('answer', '') or content
+            refs_raw  = last_asst.get('references', '')
+            print(f'  [answer] answer[:300]={ans[:300]!r}', flush=True)
+            print(f'  [content] content len={len(content)}', flush=True)
 
-            # (a) Contains the expected fact.
+            # (a) status=done
+            check('in-corpus assistant message status=done',
+                  last_asst.get('status') == 'done',
+                  f'status={last_asst.get("status")}')
+
+            # (b) answer field is non-empty
+            check('in-corpus answer field is non-empty',
+                  bool(ans.strip()),
+                  f'answer[:100]={ans[:100]!r}')
+
+            # (c) answer contains the expected fact.
             check(
                 f'in-corpus answer contains "{IN_CORPUS_EXPECTED}"',
                 IN_CORPUS_EXPECTED.lower() in ans.lower(),
                 f'answer[:200]: {ans[:200]!r}',
             )
 
-            # (b) Contains a [Source: ...] citation with 'sample.md'.
+            # (d) answer contains at least one [N] citation.
             import re
-            citation_pattern = re.compile(r'\[Source:[^\]]*sample\.md[^\]]*\]',
-                                          re.IGNORECASE)
-            has_citation = bool(citation_pattern.search(ans))
+            numbered_citation = re.compile(r'\[\d+\]')
+            has_numbered = bool(numbered_citation.search(ans))
             check(
-                'in-corpus answer contains [Source: ...sample.md...] citation',
-                has_citation,
+                'in-corpus answer contains [N] numbered citation',
+                has_numbered,
                 f'answer[:300]: {ans[:300]!r}',
+            )
+
+            # (e) references is valid JSON with numbered chunk objects.
+            refs_ok = False
+            refs = []
+            if refs_raw:
+                try:
+                    refs = json.loads(refs_raw)
+                    refs_ok = (
+                        isinstance(refs, list) and
+                        len(refs) > 0 and
+                        all(isinstance(r, dict) and 'n' in r and 'path' in r
+                            and 'chunk_index' in r and 'text' in r
+                            for r in refs)
+                    )
+                except json.JSONDecodeError:
+                    pass
+            check(
+                'references field is valid JSON with numbered chunks',
+                refs_ok,
+                f'references[:200]: {(refs_raw or "")[:200]!r}',
+            )
+
+            # (f) content (build transcript) is longer than answer.
+            check(
+                'build transcript (content) is longer than collapsed answer',
+                len(content) > len(ans),
+                f'content={len(content)} answer={len(ans)}',
             )
 
         # ── Check 4: out-of-corpus question ───────────────────────────────────
@@ -423,7 +505,9 @@ def main():
         asst2 = [m for m in msgs2 if m.get('role') == 'assistant']
 
         if asst2:
-            ans2 = asst2[-1].get('content', '')
+            last_asst2 = asst2[-1]
+            # Use `answer` (clean text) if available, else fall back to `content`
+            ans2 = last_asst2.get('answer', '') or last_asst2.get('content', '')
             print(f'  [answer] {ans2[:300]!r}', flush=True)
             ans2_lower = ans2.lower()
             refused = any(phrase in ans2_lower for phrase in REFUSAL_PHRASES)

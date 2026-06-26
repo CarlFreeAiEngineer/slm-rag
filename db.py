@@ -143,12 +143,20 @@ def init_db(path: str) -> sqlite3.Connection:
             status      TEXT    NOT NULL DEFAULT 'done',
                                             -- streaming | done | error
             n_tokens    INTEGER,            -- filled in when generation finishes
-            gen_ms      INTEGER             -- wall-clock ms for generation
+            gen_ms      INTEGER,            -- wall-clock ms for generation
+            answer      TEXT,              -- clean final answer (no prompt prefix)
+            refs        TEXT               -- JSON: [{n, path, chunk_index, text}, ...]
         )
     """)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id)"
     )
+
+    # Migration: add answer/references columns to an existing messages table.
+    existing_msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    for col_name, col_type in (("answer", "TEXT"), ("refs", "TEXT")):
+        if col_name not in existing_msg_cols:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}")
 
     # -- requests (work queue) -----------------------------------------------
     # The incoming work queue; kind covers the RAG-specific operations
@@ -389,6 +397,8 @@ def insert_message(
     status: str = 'done',
     n_tokens: int | None = None,
     gen_ms: int | None = None,
+    answer: str | None = None,
+    references: str | None = None,
 ) -> int:
     """Insert one chat message row.  Returns the new message id.
 
@@ -396,17 +406,22 @@ def insert_message(
     ----------
     session_id : conversation grouping key
     role       : 'user' | 'assistant'
-    content    : message text (may be partial for streaming rows)
+    content    : message text (may be partial for streaming rows; full build
+                 transcript when done)
     request_id : ties this message to a requests row (optional)
     status     : 'streaming' | 'done' | 'error'
     n_tokens   : token count (filled when generation finishes)
     gen_ms     : wall-clock ms for generation (filled when generation finishes)
+    answer     : clean final answer text (no prompt prefix); filled when done
+    references : JSON string: [{n, path, chunk_index, text}, ...]; stored as
+                 'refs' column (references is a SQLite reserved word)
     """
     ts = _now()
     cur = conn.execute(
         "INSERT INTO messages(session_id, request_id, role, content, ts, status, "
-        "n_tokens, gen_ms) VALUES(?,?,?,?,?,?,?,?)",
-        (session_id, request_id, role, content, ts, status, n_tokens, gen_ms),
+        "n_tokens, gen_ms, answer, refs) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (session_id, request_id, role, content, ts, status,
+         n_tokens, gen_ms, answer, references),
     )
     conn.commit()
     return cur.lastrowid
@@ -419,12 +434,22 @@ def update_message(
     status: str = 'done',
     n_tokens: int | None = None,
     gen_ms: int | None = None,
+    answer: str | None = None,
+    references: str | None = None,
 ) -> None:
     """Update a message row in place (used to grow streaming content and
-    mark it done when generation completes)."""
+    mark it done when generation completes).
+
+    Parameters
+    ----------
+    content    : full build transcript (prompt + streamed tokens)
+    answer     : clean answer text (filled on status='done')
+    references : JSON string [{n, path, chunk_index, text}] (stored as 'refs' column)
+    """
     conn.execute(
-        "UPDATE messages SET content=?, status=?, n_tokens=?, gen_ms=? WHERE id=?",
-        (content, status, n_tokens, gen_ms, message_id),
+        "UPDATE messages SET content=?, status=?, n_tokens=?, gen_ms=?, "
+        "answer=?, refs=? WHERE id=?",
+        (content, status, n_tokens, gen_ms, answer, references, message_id),
     )
     conn.commit()
 
@@ -436,15 +461,19 @@ def get_messages(
     """Return all messages for *session_id* ordered by insertion time (id ASC).
 
     Each element is a dict with keys: id, session_id, request_id, role, content,
-    ts, status, n_tokens, gen_ms.
+    ts, status, n_tokens, gen_ms, answer, references.
+    The 'refs' DB column is exposed as 'references' in the returned dicts for
+    cleaner API semantics.
     """
     rows = conn.execute(
         "SELECT id, session_id, request_id, role, content, ts, status, "
-        "n_tokens, gen_ms FROM messages WHERE session_id=? ORDER BY id",
+        "n_tokens, gen_ms, answer, refs "
+        "FROM messages WHERE session_id=? ORDER BY id",
         (session_id,),
     ).fetchall()
+    # Map 'refs' column back to 'references' key for the API / frontend
     keys = ('id', 'session_id', 'request_id', 'role', 'content',
-            'ts', 'status', 'n_tokens', 'gen_ms')
+            'ts', 'status', 'n_tokens', 'gen_ms', 'answer', 'references')
     return [dict(zip(keys, row)) for row in rows]
 
 

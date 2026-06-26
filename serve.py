@@ -108,20 +108,21 @@ DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
 # fine-tuning and serving share the same template so the model reinforces the
 # grounded, cited behaviour that the server expects here.
 #
-# Citation format: [Source: <path>, chunk <n>]
-# Each context chunk is labelled with that header before being passed to the
-# model, and the model is instructed to reproduce those labels in its answer.
+# Citation format: [N] where N is the 1-based index of the numbered data chunk.
+# Chunks are numbered [1]..[N] in retrieval order (most relevant first).
+# The model is instructed to cite chunks by number, e.g. [1] or [2][3].
 # The "I don't know" phrase is fixed so tests can match it reliably.
+#
+# NOTE: This prompt format MUST stay in sync with training/finetune_phi_rag.ipynb.
 ##############################################################################
 
 SYSTEM_PROMPT = (
     "You are a precise document-grounded assistant. "
-    "Answer the user's question using ONLY the information in the provided context. "
-    "For every claim you make, cite the source using the format: "
-    "[Source: <filename>, chunk <n>]. "
-    "If the answer is not present in the context, reply with exactly: "
+    "Answer the user's question using ONLY the information in the numbered data chunks below. "
+    "Do not use any outside knowledge. "
+    "Cite the chunks you use by their number in square brackets, e.g. [1] or [2][3]. "
+    "If the answer is not present in the provided chunks, reply with exactly: "
     "\"I don't know based on the provided documents.\""
-    " Do not use any prior knowledge outside the supplied context."
 )
 
 # Number of recent conversation turns to include in the prompt for multi-turn
@@ -136,30 +137,33 @@ CHAT_TOP_K = 5
 def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
     """Assemble the user-turn content that is sent to Phi alongside SYSTEM_PROMPT.
 
-    The context section contains each retrieved chunk labelled with its
-    [Source: <path>, chunk <n>] header so the model can reproduce those labels
-    in its answer.  The last PROMPT_TURNS of prior conversation are prepended
-    as plain Human/Assistant turns so multi-turn dialogue works.
+    Context chunks are numbered [1]..[N] in retrieval order (most relevant first).
+    The model cites chunks by number (e.g. [1] or [2][3]).
+
+    NOTE: This format MUST stay in sync with training/finetune_phi_rag.ipynb.
 
     Parameters
     ----------
     question : the current user question (bare text)
     hits     : list of chunk dicts returned by knn_chunks_with_score / get_chunk_by_id;
-               each must have keys 'path', 'chunk_index', and 'text'
+               each must have keys 'path', 'chunk_index', and 'text'.
+               hits[0] is the MOST relevant (closest k-NN hit).
     history  : recent messages from get_messages() (excluding the current user turn);
                only the last PROMPT_TURNS * 2 rows are used
 
     Returns
     -------
     The string to use as the 'user' role content in the chat completion request.
+    Numbered chunks appear first ([1] = most relevant), then the Question line,
+    then the instruction line.
     """
-    # Build context section: each chunk gets a [Source: …] header so the model
-    # knows exactly which label to repeat when it cites that chunk.
-    context_parts = []
-    for hit in hits:
-        header = f"[Source: {hit['path']}, chunk {hit['chunk_index']}]"
-        context_parts.append(f"{header}\n{hit['text']}")
-    context_block = '\n\n'.join(context_parts) if context_parts else '(no context retrieved)'
+    # Build numbered context chunks: [1] = most relevant (retrieval order).
+    chunk_lines = []
+    for i, hit in enumerate(hits, start=1):
+        chunk_lines.append(
+            f"[{i}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}"
+        )
+    context_block = '\n\n'.join(chunk_lines) if chunk_lines else '[no context retrieved]'
 
     # Include recent conversation history so the model can answer follow-up
     # questions that refer back to earlier turns.  We limit to the last
@@ -171,14 +175,66 @@ def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
         lines = []
         for m in recent:
             prefix = 'Human' if m['role'] == 'user' else 'Assistant'
-            lines.append(f"{prefix}: {m['content']}")
+            # Use clean answer text for history if available, else full content
+            content = m.get('answer') or m.get('content') or ''
+            lines.append(f"{prefix}: {content}")
         history_block = '\n'.join(lines) + '\n\n'
+
+    instruction = (
+        "Answer using ONLY the numbered chunks above. "
+        "Cite by number, e.g. [1] or [2][3]. "
+        "If the answer is not in the chunks, say exactly: "
+        "\"I don't know based on the provided documents.\""
+    )
 
     return (
         f"{history_block}"
-        f"Context:\n{context_block}\n\n"
-        f"Question: {question}"
+        f"{context_block}\n\n"
+        f"Question: {question}\n\n"
+        f"{instruction}"
     )
+
+
+def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) -> list[str]:
+    """Return the prompt as an ordered list of pieces for paced streaming.
+
+    Pieces (in order):
+      1. History block (if any) -- one piece
+      2. Each numbered chunk [1]..[N] -- one piece per chunk
+      3. Question + instruction footer -- one piece
+
+    The caller streams these into the DB one by one with a small sleep between
+    pieces so the browser sees the prompt build up visually.
+    """
+    pieces = []
+
+    # History block
+    recent = [m for m in history if m['role'] in ('user', 'assistant')]
+    recent = recent[-(PROMPT_TURNS * 2):]
+    if recent:
+        lines = []
+        for m in recent:
+            prefix = 'Human' if m['role'] == 'user' else 'Assistant'
+            content = m.get('answer') or m.get('content') or ''
+            lines.append(f"{prefix}: {content}")
+        pieces.append('\n'.join(lines) + '\n\n')
+
+    # Numbered chunks (most relevant first)
+    for i, hit in enumerate(hits, start=1):
+        pieces.append(
+            f"[{i}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}\n\n"
+        )
+
+    # Question + instruction footer
+    instruction = (
+        "Answer using ONLY the numbered chunks above. "
+        "Cite by number, e.g. [1] or [2][3]. "
+        "If the answer is not in the chunks, say exactly: "
+        "\"I don't know based on the provided documents.\""
+    )
+    pieces.append(f"Question: {question}\n\n{instruction}")
+
+    return pieces
 
 
 ##############################################################################
@@ -578,17 +634,29 @@ def _ingest_background(doc_id: int, rel_path: str, request_id: str):
 # Flow for each chat request:
 #   1. Embed the question (embed gate, 'search_query: ' prefix).
 #   2. k-NN retrieval (no gate -- pure SQLite).
-#   3. Build grounded prompt (SYSTEM_PROMPT + context + history).
-#   4. Insert streaming assistant message row.
-#   5. Generate (gen gate) -- non-streaming because we update the DB row when
-#      generation finishes (no partial tokens from the llama-server HTTP path).
-#   6. Update message row: content=reply, status='done', n_tokens, gen_ms.
-#   7. Log embed_request/embed_response + gen_request/gen_response with both
-#      the request id and the session id so they can be grepped together.
+#   3. Build grounded prompt pieces (numbered [1]..[N] chunks, most relevant first).
+#   4. Insert streaming assistant message row (content='', status='streaming').
+#   5a. PACED PROMPT STREAMING: write each prompt piece into content with a
+#       small time.sleep(~0.12) so the browser sees the prompt build up visually.
+#   5b. GENERATION STREAMING: stream Phi's token deltas into content via
+#       generate_grounded_streaming(); flush DB at most every ~80ms or ~20 tokens.
+#   6. On done: set status='done', store clean answer in `answer` column, store
+#      numbered references JSON in `references` column.
+#   7. Log embed_request/embed_response + gen_request/gen_response (COMPLETE,
+#      untruncated) with both the request id and session id.
 ##############################################################################
 
 # Signal the worker to stop when the server is shutting down.
 _worker_stop = threading.Event()
+
+# How long to sleep between paced prompt pieces (seconds).
+_PROMPT_PIECE_SLEEP = 0.12
+
+# How often to flush streaming token accumulation to the DB (seconds).
+_TOKEN_FLUSH_INTERVAL = 0.08
+
+# How many tokens to accumulate before a forced DB flush (fallback bound).
+_TOKEN_FLUSH_COUNT = 20
 
 
 def _chat_worker():
@@ -625,6 +693,8 @@ def _chat_worker():
         print(f'[worker] processing request_id={request_id} '
               f'session_id={session_id} question={question[:80]!r}', flush=True)
 
+        msg_id = None  # set in Step 4; used in error handler
+
         try:
             # ── Step 1: embed the question (embed gate) ───────────────────────
             prefixed = 'search_query: ' + question
@@ -659,6 +729,7 @@ def _chat_worker():
             prior_history = [m for m in history if m['role'] != 'user' or
                              m['content'] != question]
             user_content = build_prompt(question, hits, prior_history)
+            prompt_pieces = build_prompt_pieces(question, hits, prior_history)
 
             # ── Step 4: insert streaming assistant message row ────────────────
             with _db_lock:
@@ -671,7 +742,28 @@ def _chat_worker():
                     status='streaming',
                 )
 
-            # ── Step 5: generate (gen gate) ───────────────────────────────────
+            # ── Step 5a: paced prompt streaming ───────────────────────────────
+            # Write each prompt piece into the message content with a small
+            # sleep between pieces so the browser sees the numbered chunks
+            # appear one by one.  The browser polls /history at ~150-200ms so
+            # this pace matches its rendering cadence.
+            accumulated = ''
+            for piece in prompt_pieces:
+                accumulated += piece
+                with _db_lock:
+                    _db_mod.update_message(
+                        _db_conn, msg_id, accumulated, status='streaming'
+                    )
+                time.sleep(_PROMPT_PIECE_SLEEP)
+
+            # Separator between prompt and generation output
+            accumulated += '\n\n--- Generating answer ---\n\n'
+            with _db_lock:
+                _db_mod.update_message(
+                    _db_conn, msg_id, accumulated, status='streaming'
+                )
+
+            # ── Step 5b: streaming generation ─────────────────────────────────
             # Log the COMPLETE prompt sent to Phi (full system + full user content)
             # -- accurate, untruncated records of every model prompt are required.
             log_event('gen_request', ip, 'WORKER', '/enqueue',
@@ -681,27 +773,83 @@ def _chat_worker():
                           'user':    user_content,
                           'n_hits':  len(hits),
                       }, ensure_ascii=False))
+
             gen_t0 = time.time()
             infer_enter()
+
+            # For streaming: accumulate tokens and flush to DB every ~80ms or
+            # every ~20 tokens to bound the number of DB writes without making
+            # the browser wait too long for each token update.
+            token_buf     = ''
+            last_flush    = time.time()
+            tok_since_flush = 0
+
+            def _on_token(token):
+                nonlocal accumulated, token_buf, last_flush, tok_since_flush
+                token_buf += token
+                tok_since_flush += 1
+                now = time.time()
+                if (now - last_flush >= _TOKEN_FLUSH_INTERVAL or
+                        tok_since_flush >= _TOKEN_FLUSH_COUNT):
+                    accumulated += token_buf
+                    token_buf = ''
+                    tok_since_flush = 0
+                    last_flush = now
+                    with _db_lock:
+                        _db_mod.update_message(
+                            _db_conn, msg_id, accumulated, status='streaming'
+                        )
+
             try:
-                with gen_gate:
-                    reply, n_tokens = _gen_backend.generate_grounded(
-                        SYSTEM_PROMPT, user_content, max_tokens=512
-                    )
+                # Use streaming if the gen backend supports it (ProxyBackend on Windows).
+                if hasattr(_gen_backend, 'generate_grounded_streaming'):
+                    with gen_gate:
+                        reply, n_tokens = _gen_backend.generate_grounded_streaming(
+                            SYSTEM_PROMPT, user_content,
+                            token_callback=_on_token,
+                            max_tokens=512,
+                        )
+                else:
+                    # InProc fallback (Linux): non-streaming, update once at the end.
+                    with gen_gate:
+                        reply, n_tokens = _gen_backend.generate_grounded(
+                            SYSTEM_PROMPT, user_content, max_tokens=512
+                        )
+                    # Simulate token callback for the flush path below
+                    token_buf = reply
             finally:
                 infer_exit()
+
             gen_ms = int((time.time() - gen_t0) * 1000)
+
+            # Flush any remaining token buffer
+            if token_buf:
+                accumulated += token_buf
+                token_buf = ''
 
             log_event('gen_response', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
                       status=200, n_tokens=n_tokens, latency_ms=gen_ms,
                       response_body=reply or '')
 
-            # ── Step 6: update message row to done ────────────────────────────
+            # ── Step 6: mark done, store clean answer + references ────────────
+            # Build numbered references list matching the chunks used in the prompt.
+            refs = [
+                {
+                    'n':           i,
+                    'path':        hit['path'],
+                    'chunk_index': hit['chunk_index'],
+                    'text':        hit['text'],
+                }
+                for i, hit in enumerate(hits, start=1)
+            ]
+            refs_json = json.dumps(refs, ensure_ascii=False)
+
             with _db_lock:
                 _db_mod.update_message(
-                    _db_conn, msg_id, reply,
-                    status='done', n_tokens=n_tokens, gen_ms=gen_ms
+                    _db_conn, msg_id, accumulated,
+                    status='done', n_tokens=n_tokens, gen_ms=gen_ms,
+                    answer=reply, references=refs_json,
                 )
                 _db_mod.mark_request(_db_conn, req['id'], 'done')
 
@@ -713,13 +861,9 @@ def _chat_worker():
             print(f'[worker] ERROR request_id={request_id}: {err}', flush=True)
             try:
                 with _db_lock:
-                    # Update the streaming message row to error status if it was
-                    # already created before the exception.  msg_id is only
-                    # defined if Step 4 completed, so use locals() to check.
-                    _mid = locals().get('msg_id')
-                    if _mid is not None:
+                    if msg_id is not None:
                         _db_mod.update_message(
-                            _db_conn, _mid,
+                            _db_conn, msg_id,
                             f'[Error: {err}]',
                             status='error',
                         )
@@ -940,6 +1084,86 @@ class ProxyBackend:
                     msg.get('reasoning_content') or '')
             n_tokens = obj.get('usage', {}).get('completion_tokens', 0) or 0
             return text, n_tokens
+        finally:
+            conn.close()
+
+    def generate_grounded_streaming(self, system_prompt, user_content,
+                                    token_callback,
+                                    max_tokens=512, temperature=0.1, top_p=0.9):
+        """POST /v1/chat/completions with stream=true; call token_callback(token)
+        for each token delta as it arrives via SSE.
+
+        Returns (full_text, n_tokens) on completion.  n_tokens is the count of
+        tokens reported by the SSE 'usage' field (or approximated by counting
+        non-empty deltas if the field is absent).
+
+        The SSE stream format from llama-server is:
+          data: {"choices":[{"delta":{"content":"..."}}], ...}
+          data: [DONE]
+        """
+        payload = json.dumps({
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user',   'content': user_content},
+            ],
+            'max_tokens':   max_tokens,
+            'temperature':  temperature,
+            'top_p':        top_p,
+            'stream':       True,
+            'stream_options': {'include_usage': True},
+        }).encode()
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=300)
+        try:
+            conn.request('POST', '/v1/chat/completions', payload,
+                         headers={'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            if resp.status >= 400:
+                err = resp.read().decode('utf-8', 'replace')
+                raise RuntimeError(f'gen HTTP {resp.status}: {err}')
+
+            full_text = ''
+            n_tokens  = 0
+            token_count = 0
+            stream_done = False
+            # Read SSE line by line; llama-server sends 'data: ...\n\n' per chunk.
+            buf = b''
+            while not stream_done:
+                chunk = resp.read(256)   # read in small blocks (not byte-by-byte)
+                if not chunk:
+                    break
+                buf += chunk
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    line = line.rstrip(b'\r').decode('utf-8', 'replace')
+                    if not line.startswith('data:'):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == '[DONE]':
+                        stream_done = True
+                        break
+                    try:
+                        obj = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    # Token delta -- choices may be empty on the final usage chunk
+                    choices = obj.get('choices') or []
+                    if choices:
+                        delta = choices[0].get('delta', {})
+                        token = (delta.get('content') or
+                                 delta.get('reasoning') or
+                                 delta.get('reasoning_content') or '')
+                        if token:
+                            full_text += token
+                            token_count += 1
+                            token_callback(token)
+                    # Usage field (may appear on final chunk or a separate chunk)
+                    usage = obj.get('usage') or {}
+                    if usage.get('completion_tokens'):
+                        n_tokens = usage['completion_tokens']
+
+            if n_tokens == 0:
+                n_tokens = token_count
+            return full_text, n_tokens
         finally:
             conn.close()
 
@@ -2463,12 +2687,30 @@ def cli_repl(base_url):
             print('[cli] No answer available yet.', flush=True)
             continue
 
-        answer = asst_msgs[-1].get('content', '').strip()
+        # Use the clean `answer` field (no prompt prefix); fall back to content.
+        last_asst = asst_msgs[-1]
+        answer = (last_asst.get('answer') or last_asst.get('content', '')).strip()
         # Print the answer with a blank line above and below for readability.
-        # Citations ([Source: <file>, chunk <n>]) are already embedded in the
-        # answer text by the grounded prompt, so they print inline here without
-        # any extra formatting -- exactly the behaviour described in the README.
+        # Numbered citations [1][2] are embedded in the answer text by the prompt.
         print(f'\n{answer}\n', flush=True)
+
+        # Expand numbered citations into [Source: ...] lines so the terminal
+        # output is human-readable and backward-compatible with tooling that
+        # expects [Source: <file>, chunk <n>] markers in the CLI transcript.
+        refs_raw = last_asst.get('references')
+        if refs_raw:
+            try:
+                refs = json.loads(refs_raw)
+                if refs:
+                    print('[cli] Sources:', flush=True)
+                    for ref in refs:
+                        print(
+                            f'  [{ref["n"]}] [Source: {ref["path"]}, chunk {ref["chunk_index"]}]',
+                            flush=True,
+                        )
+                    print('', flush=True)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
 
 
 ##############################################################################
