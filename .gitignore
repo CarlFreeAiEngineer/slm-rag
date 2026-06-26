@@ -28,9 +28,11 @@ bin/llama.cpp/
 
 # --- Ingested corpus & vector store (per-user data) ---
 ragdocs/
-rag.db
-rag.db-wal
-rag.db-shm
+# all SQLite DBs are per-user/scratch runtime data: rag.db (default) plus any
+# eval/smoke scratch DBs (exp2_temp.db, smoke_local.db, ...) and their WAL/SHM sidecars
+*.db
+*.db-wal
+*.db-shm
 
 # --- Runtime / scratch ---
 tmp/
