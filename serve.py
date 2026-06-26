@@ -529,22 +529,50 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _embed_resilient(text, attempts=3, timeout=120):
-    """Embed with retries and a generous timeout.
+def _embed_resilient(text, attempts=3, timeout=30, max_restarts=2):
+    """Embed with retries, restarting the embedder if its inference slot wedges.
 
-    The embedder is CPU-bound (the GPU is reserved for Phi), so under a load spike
-    a single embed can transiently exceed the default timeout. One blip should not
-    fail a whole ingest or a user's question, so we retry a few times before giving
-    up. Used by both the ingest worker and the chat query-embed."""
+    Two failure modes are handled:
+
+    * Transient slowness -- the embedder is CPU-bound (the GPU is reserved for the
+      generator), so under a load spike a single embed can exceed the timeout. A
+      plain retry clears that. (A warm embed takes well under a second, so the 30s
+      timeout is huge headroom; the cold first-inference is warmed separately at
+      boot with its own generous timeout, not here.)
+    * A wedged slot -- a llama-server embedding slot can DEADLOCK (process alive,
+      /health instant, but /v1/embeddings hangs at 0% CPU forever). A client
+      timeout abandons the request but cannot free the slot, so retrying the SAME
+      process just hangs again and poisons every later embed -- ingest AND chat --
+      until a manual restart. A timeout or dropped connection is therefore treated
+      as a wedged/dead backend: we restart the embedder subprocess (bounded) and
+      retry against the fresh process, so ingest and chat self-heal.
+
+    Callers (ingest worker, chat query-embed) hold embed_gate, so the restart can
+    never race another embed. In-process backends (Linux) have no subprocess to
+    restart -- the hasattr() guard skips them; they don't hit this HTTP-slot hang."""
     last = None
+    restarts = 0
     for attempt in range(attempts):
         try:
             return _embed_backend.embed(text, timeout=timeout)
         except Exception as e:
             last = e
-            print(f'[serve] embed attempt {attempt + 1}/{attempts} failed ({e}); '
-                  f'retrying ...', flush=True)
-            time.sleep(1.0)
+            # A timeout or connection failure means the slot is wedged or the
+            # process died; retrying the same process won't help -- restart it.
+            wedged = isinstance(e, (TimeoutError, ConnectionError))
+            print(f'[serve] embed attempt {attempt + 1}/{attempts} failed ({e!r})',
+                  flush=True)
+            if wedged and restarts < max_restarts and hasattr(_embed_backend, 'restart'):
+                restarts += 1
+                print(f'[serve] embedder appears wedged -- restarting it to clear the '
+                      f'slot ({restarts}/{max_restarts}), then retrying ...', flush=True)
+                try:
+                    if not _embed_backend.restart():
+                        print('[serve] embedder restart did not come up ready', flush=True)
+                except Exception as re_:
+                    print(f'[serve] embedder restart raised: {re_!r}', flush=True)
+            else:
+                time.sleep(1.0)
     raise last
 
 
@@ -1018,6 +1046,18 @@ class ProxyBackend:
                 self.proc.kill()
                 self.proc.wait()
         self.proc = None
+
+    def restart(self):
+        """Kill and re-boot the subprocess to clear a wedged inference slot.
+
+        A llama-server embedding slot can DEADLOCK: the process stays alive and
+        /health is instant, but /v1/embeddings hangs at 0% CPU forever.  A client
+        timeout abandons the request but cannot free the slot, so the only recovery
+        is to kill and relaunch the process.  Mutates self.proc in place, so the
+        global backend reference stays valid.  Returns True if the fresh process
+        came up ready (boot() includes a real-inference warmup)."""
+        self.stop()
+        return self.boot()
 
     # ── Embedding (embedder backend only) ────────────────────────────────────
 
