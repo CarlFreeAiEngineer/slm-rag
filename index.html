@@ -335,62 +335,6 @@
     }
     .show-build-toggle:hover { color: #4b5563; }
 
-    /* Fix-it control */
-    .fix-it-ctrl {
-      margin-top: 0.5rem;
-      font-size: 0.75rem;
-      color: #9ca3af;
-    }
-    .fix-it-btn {
-      background: none;
-      border: none;
-      color: #9ca3af;
-      font-size: 0.75rem;
-      cursor: pointer;
-      padding: 0;
-      text-decoration: underline;
-    }
-    .fix-it-btn:hover { color: #4b5563; }
-
-    .fix-it-form {
-      margin-top: 0.5rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-    .fix-it-form textarea {
-      width: 100%;
-      border: 1px solid #d1d5db;
-      border-radius: 4px;
-      padding: 0.4rem;
-      font-size: 0.82rem;
-      font-family: inherit;
-      resize: vertical;
-      min-height: 3rem;
-    }
-    .fix-it-form-btns {
-      display: flex;
-      gap: 0.5rem;
-    }
-    .fix-it-submit {
-      background: #1a1a2e;
-      color: #fff;
-      border: none;
-      border-radius: 4px;
-      padding: 0.3rem 0.7rem;
-      font-size: 0.75rem;
-      cursor: pointer;
-    }
-    .fix-it-submit:hover { background: #2d2d5c; }
-    .fix-it-cancel {
-      background: #fff;
-      border: 1px solid #ccc;
-      border-radius: 4px;
-      padding: 0.3rem 0.7rem;
-      font-size: 0.75rem;
-      cursor: pointer;
-    }
-
     /* Chat input area */
     .chat-input-area {
       padding: 0.8rem 1rem;
@@ -566,7 +510,6 @@ let sessionId = null;        // minted on first enqueue, held until /clear
 let treePoller = null;       // setInterval handle for tree refresh
 let pendingRid  = null;      // request_id currently being polled
 let answerPoller = null;     // setInterval handle while polling for answer
-let _finishing  = false;     // guard so the answer is collapsed exactly once
 
 const TREE_POLL_MS      = 3000;
 const ANSWER_POLL_MS    = 3000;   // backup /request poll (the fast history poll collapses first)
@@ -821,84 +764,87 @@ function renderNumberedAnswer(answerText, references) {
   return html;
 }
 
-function buildCollapsedBubble(answerText, references, buildContent, lastUserQuestion) {
-  // Container for the collapsed view
-  const wrap = document.createElement('div');
-  wrap.className = 'answer-view';
+// Render the cited answer (with [A] footnote markers + clickable inline source
+// expanders) into `container`. Expanders are scoped to the container via a data
+// attribute, so multiple assistant messages on screen never collide.
+function _renderCitedAnswer(container, answerText, references) {
+  container.innerHTML = renderNumberedAnswer(answerText, references);
 
-  // Render the answer with numbered footnote markers
-  const answerDiv = document.createElement('div');
-  answerDiv.innerHTML = renderNumberedAnswer(answerText, references);
-  wrap.appendChild(answerDiv);
-
-  // Build inline expanders (hidden by default) -- one per unique ref number cited
   const refMap = {};
   (references || []).forEach(r => { refMap[r.n] = r; });
 
-  // Collect cited letter labels from answer
   const cited = new Set();
-  (answerText.match(/\[([A-Z]+)\]/g) || []).forEach(m => {
-    cited.add(m.slice(1, -1));
-  });
+  (answerText.match(/\[([A-Z]+)\]/g) || []).forEach(m => cited.add(m.slice(1, -1)));
 
   cited.forEach(n => {
     const ref = refMap[n];
     if (!ref) return;
     const expander = document.createElement('div');
     expander.className = 'fn-expander';
-    expander.id = `fn-expander-${n}`;
+    expander.dataset.fn = n;
     const srcLine = document.createElement('div');
     srcLine.className = 'fn-source';
     srcLine.textContent = `[${n}] source: ${ref.path}, chunk ${ref.chunk_index}`;
     expander.appendChild(srcLine);
-    const textNode = document.createTextNode(ref.text);
-    expander.appendChild(textNode);
-    wrap.appendChild(expander);
+    expander.appendChild(document.createTextNode(ref.text));
+    container.appendChild(expander);
   });
 
-  // Wire footnote marker clicks to toggle expanders
-  answerDiv.querySelectorAll('.fn-marker').forEach(marker => {
+  container.querySelectorAll('.fn-marker').forEach(marker => {
     marker.addEventListener('click', () => {
       const n = marker.dataset.fn;
-      const exp = document.getElementById('fn-expander-' + n);
+      const exp = container.querySelector(`.fn-expander[data-fn="${n}"]`);
       if (exp) {
         exp.classList.toggle('open');
-        // Also highlight the source file in the tree
         const ref = refMap[n];
-        if (ref) {
-          treeList.querySelectorAll('.tree-item').forEach(li => {
-            li.classList.toggle('active', li.dataset.path === ref.path);
-          });
-        }
+        if (ref) treeList.querySelectorAll('.tree-item').forEach(li =>
+          li.classList.toggle('active', li.dataset.path === ref.path));
       }
     });
   });
+}
 
-  // "show how this was built" toggle
-  if (buildContent) {
-    const toggle = document.createElement('div');
-    toggle.className = 'show-build-toggle';
-    toggle.textContent = '▸ show how this was built';
-    wrap.appendChild(toggle);
+// Create the DOM element for one assistant message: a body (three-dots while
+// in-flight, cited answer once done) plus an always-present expand/collapse that
+// reveals the verbatim transcript (prompt + response). Identical control during
+// and after streaming.
+function _makeAssistantEl(msgId) {
+  const div = document.createElement('div');
+  div.className = 'msg msg-assistant';
+  if (msgId != null) div.id = 'asst-' + msgId;
+  div.innerHTML =
+    '<div class="answer-view">' +
+      '<div class="asst-body"></div>' +
+      '<div class="show-build-toggle">▸ show prompt &amp; response</div>' +
+      '<div class="build-view" style="display:none"></div>' +
+    '</div>';
+  const toggle = div.querySelector('.show-build-toggle');
+  const raw = div.querySelector('.build-view');
+  toggle.addEventListener('click', () => {
+    const open = raw.style.display !== 'none';
+    raw.style.display = open ? 'none' : 'block';
+    toggle.textContent = open ? '▸ show prompt & response'
+                              : '▾ hide prompt & response';
+  });
+  return div;
+}
 
-    const buildView = document.createElement('div');
-    buildView.className = 'build-view';
-    buildView.style.display = 'none';
-    buildView.textContent = buildContent;
-    wrap.appendChild(buildView);
-
-    toggle.addEventListener('click', () => {
-      const open = buildView.style.display !== 'none';
-      buildView.style.display = open ? 'none' : 'block';
-      toggle.textContent = open ? '▸ show how this was built' : '▾ hide build details';
-    });
+// Update an assistant element from its message record. Preserves the expander's
+// open/closed state (we only set textContent, never rebuild the toggle).
+function _updateAssistantEl(div, m) {
+  const body = div.querySelector('.asst-body');
+  const raw = div.querySelector('.build-view');
+  raw.textContent = m.content || '';
+  if (m.status === 'done') {
+    let refs = [];
+    if (m.references) { try { refs = JSON.parse(m.references); } catch {} }
+    _renderCitedAnswer(body, m.answer || m.content || '', refs);
+  } else if (m.status === 'error') {
+    body.textContent = 'Generation error.';
+  } else {
+    body.innerHTML = '<span class="thinking-dots"><span></span> <span></span> '
+                   + '<span></span></span>';
   }
-
-  // Fix-it control
-  const fixIt = buildFixItControl(lastUserQuestion, answerText);
-  wrap.appendChild(fixIt);
-
-  return wrap;
 }
 
 // ── Chat ───────────────────────────────────────────────────────
@@ -913,240 +859,58 @@ function appendMessage(role, htmlContent, dataset) {
   return div;
 }
 
-function showThinking() {
-  const div = document.createElement('div');
-  div.className = 'thinking';
-  div.id = 'thinking-indicator';
-  div.innerHTML = `<span>Thinking</span><span class="thinking-dots">
-    <span></span><span></span><span></span></span>`;
-  chatMessages.appendChild(div);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-}
-
-function removeThinking() {
-  const el = document.getElementById('thinking-indicator');
-  if (el) el.remove();
-}
-
-// Build a fix-it control for an assistant message.
-// /correct is built in P9 and does not exist yet — the control is wired here
-// so the UI is complete, but a 404 is expected until P9 ships.
-function buildFixItControl(questionText, answerText) {
-  const ctrl = document.createElement('div');
-  ctrl.className = 'fix-it-ctrl';
-
-  const btn = document.createElement('button');
-  btn.className = 'fix-it-btn';
-  btn.textContent = 'This is wrong → fix it';
-  ctrl.appendChild(btn);
-
-  const form = document.createElement('div');
-  form.className = 'fix-it-form';
-  form.style.display = 'none';
-
-  const ta = document.createElement('textarea');
-  ta.value = answerText;
-  ta.placeholder = 'Write the correct answer here…';
-  form.appendChild(ta);
-
-  const btns = document.createElement('div');
-  btns.className = 'fix-it-form-btns';
-
-  const submit = document.createElement('button');
-  submit.className = 'fix-it-submit';
-  submit.textContent = 'Submit correction';
-
-  const cancel = document.createElement('button');
-  cancel.className = 'fix-it-cancel';
-  cancel.textContent = 'Cancel';
-
-  btns.appendChild(submit);
-  btns.appendChild(cancel);
-  form.appendChild(btns);
-  ctrl.appendChild(form);
-
-  btn.addEventListener('click', () => {
-    form.style.display = form.style.display === 'none' ? 'block' : 'none';
-  });
-  cancel.addEventListener('click', () => { form.style.display = 'none'; });
-  submit.addEventListener('click', async () => {
-    // NOTE: POST /correct is implemented in P9. Until then this will 404.
-    const correctedAnswer = ta.value.trim();
-    if (!correctedAnswer) return;
-    submit.disabled = true;
-    submit.textContent = 'Sending…';
-    try {
-      const { status, json } = await apiFetch('POST', '/correct', {
-        question: questionText,
-        context: '',   // context not stored client-side; server can recover from DB
-        answer: correctedAnswer,
-      });
-      if (status === 200) {
-        form.style.display = 'none';
-        btn.textContent = 'Correction saved ✓';
-        btn.disabled = true;
-      } else {
-        submit.disabled = false;
-        submit.textContent = 'Submit correction';
-        alert('Could not save correction (server returned ' + status + '). ' +
-              '/correct will be available in P9.');
-      }
-    } catch (e) {
-      submit.disabled = false;
-      submit.textContent = 'Submit correction';
-      console.error('correct error', e);
-    }
-  });
-
-  return ctrl;
-}
-
 // ── Streaming assistant bubble ─────────────────────────────────
 // Manages a single live assistant bubble while a message is status='streaming'.
-// The bubble shows the raw build content (monospace pre) and auto-scrolls.
+// A three-dots body while in-flight, the cited answer once done, plus an
+// always-present expand/collapse showing the verbatim prompt+response (same
+// control during and after streaming). `_liveAsstEl` is the in-flight element
+// the poller updates in place, which preserves the expander's open state.
 
-let _streamingBubble = null;   // the current live .msg-assistant div
-let _streamingMsgId  = null;   // message id of the streaming row
-let _historyPoller   = null;   // fast /history poll while streaming
+let _historyPoller = null;   // fast /history poll while a request is in flight
+let _liveAsstEl    = null;   // the assistant element being streamed into
+let _finished      = false;  // guard so finalize runs once per request
 
-function _startStreamingBubble() {
-  if (_streamingBubble) return;
-  const div = document.createElement('div');
-  div.className = 'msg msg-assistant';
-  div.id = 'streaming-bubble';
-  const buildView = document.createElement('div');
-  buildView.className = 'build-view';
-  buildView.id = 'streaming-build-view';
-  div.appendChild(buildView);
-  chatMessages.appendChild(div);
-  _streamingBubble = div;
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+function _stopPollers() {
+  if (_historyPoller) { clearInterval(_historyPoller); _historyPoller = null; }
+  if (answerPoller)   { clearInterval(answerPoller);   answerPoller = null; }
 }
 
-function _updateStreamingBubble(content) {
-  if (!_streamingBubble) _startStreamingBubble();
-  const bv = document.getElementById('streaming-build-view');
-  if (bv) bv.textContent = content;
-  // Auto-scroll so the user always sees the latest output
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+// Fetch /history once and update the in-flight assistant element in place.
+// Returns the terminal status ('done'/'error'), or null while still streaming.
+async function _pollOnce(sid, rid) {
+  const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
+  const msgs = json.messages || [];
+  const asst = msgs.filter(m => m.role === 'assistant' && m.request_id === rid);
+  if (asst.length === 0) return null;
+  const m = asst[asst.length - 1];
+  if (_liveAsstEl) _updateAssistantEl(_liveAsstEl, m);
+  return (m.status === 'done' || m.status === 'error') ? m.status : null;
 }
 
-function _removeStreamingBubble() {
-  if (_streamingBubble) {
-    _streamingBubble.remove();
-    _streamingBubble = null;
-  }
-}
-
-function _stopHistoryPoller() {
-  if (_historyPoller) {
-    clearInterval(_historyPoller);
-    _historyPoller = null;
-  }
-}
-
-// Collapse the streaming bubble into the final cited answer, exactly once.
-// Driven by whichever poller sees the terminal status first (normally the fast
-// history poller). The server finalizes the message (answer + references) in the
-// SAME write that flips status to 'done', so the data is ready the instant we see
-// it -- no need to wait for the slower /request poll.
-//
-// `msgs` is the message list the caller already fetched: when present we render
-// the collapsed view straight from it -- NO second /history round-trip -- which is
-// what removes the pause between the last streamed char and the final form. The
-// backup /request poller has no message list, so it falls back to a fetch.
-async function _finishAnswer(sid, errMsg, msgs) {
-  if (_finishing || pendingRid === null) return;   // already collapsed
-  _finishing = true;
-  _stopHistoryPoller();
-  if (answerPoller) { clearInterval(answerPoller); answerPoller = null; }
-  pendingRid = null;
-  try {
-    if (errMsg) {
-      _removeStreamingBubble();
-      appendMessage('system', 'Generation error: ' + escapeHtml(errMsg));
-    } else if (msgs) {
-      _renderTranscript(msgs);     // collapse from data we already hold -- no refetch
-    } else {
-      await repaintHistory(sid);   // backup path: fetch, then render
-    }
-  } finally {
-    sendBtn.disabled = false;
-    _finishing = false;
-  }
-}
-
-// Start fast polling of /history to update the streaming bubble in real time,
-// and to collapse it the moment the message reaches a terminal status.
 function _startHistoryPoller(sid, rid) {
-  _stopHistoryPoller();
+  if (_historyPoller) clearInterval(_historyPoller);
   _historyPoller = setInterval(async () => {
     try {
-      const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
-      const msgs = json.messages || [];
-      // Find the assistant message that corresponds to the current request
-      const asst = msgs.filter(m => m.role === 'assistant' && m.request_id === rid);
-      if (asst.length === 0) return;
-      const m = asst[asst.length - 1];
-      if (m.status === 'streaming') {
-        _updateStreamingBubble(m.content || '');
-      } else if (m.status === 'done') {
-        _finishAnswer(sid, null, msgs);   // collapse now, from data we already hold
-      }
-      // 'error' -> handled by the /request backup poller, which has the error text
-    } catch (e) {
-      // Ignore transient errors in history polling
-    }
+      const st = await _pollOnce(sid, rid);
+      if (st) _finalize();
+    } catch (e) { /* ignore transient history poll errors */ }
   }, HISTORY_POLL_MS);
 }
 
-// Repaint the whole conversation from GET /history.
-// The transcript is server-side state — never maintained separately client-side.
-async function repaintHistory(sid) {
-  try {
-    const { json } = await apiFetch('GET', `/history?session_id=${encodeURIComponent(sid)}`);
-    _renderTranscript(json.messages || []);
-  } catch (e) {
-    console.error('history fetch error', e);
+// End the in-flight request exactly once: stop pollers, re-enable send. The last
+// poll already rendered the final answer into _liveAsstEl; on error we overwrite
+// the body with the message text the /request poll carries.
+function _finalize(errMsg) {
+  if (_finished) return;
+  _finished = true;
+  _stopPollers();
+  pendingRid = null;
+  if (errMsg && _liveAsstEl) {
+    const body = _liveAsstEl.querySelector('.asst-body');
+    if (body) body.textContent = 'Generation error: ' + errMsg;
   }
-}
-
-// Render a fetched transcript into the chat pane (synchronous; no network).
-// Split out of repaintHistory so the streaming poller can collapse straight from
-// the message list it already has, with no extra /history round-trip.
-function _renderTranscript(msgs) {
-  // Clear existing conversation messages but keep the intro system message.
-  const systemMsg = chatMessages.querySelector('.msg-system');
-  chatMessages.innerHTML = '';
-  if (systemMsg) chatMessages.appendChild(systemMsg);
-  _streamingBubble = null;
-
-  let lastUserQuestion = '';
-  for (const m of msgs) {
-    if (m.role === 'user') {
-      lastUserQuestion = m.content || '';
-      appendMessage('user', escapeHtml(m.content || ''));
-    } else if (m.role === 'assistant') {
-      if (m.status === 'streaming') {
-        // Still building — show streaming build view
-        _startStreamingBubble();
-        _updateStreamingBubble(m.content || '');
-      } else {
-        // Done -- show collapsed view with footnotes
-        const answerText = m.answer || m.content || '';
-        let refs = [];
-        if (m.references) {
-          try { refs = JSON.parse(m.references); } catch {}
-        }
-        const msgEl = document.createElement('div');
-        msgEl.className = 'msg msg-assistant';
-        const collapsed = buildCollapsedBubble(answerText, refs, m.content, lastUserQuestion);
-        msgEl.appendChild(collapsed);
-        chatMessages.appendChild(msgEl);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
-      }
-    }
-  }
+  _liveAsstEl = null;
+  sendBtn.disabled = false;
 }
 
 async function sendQuestion() {
@@ -1158,9 +922,13 @@ async function sendQuestion() {
   chatInput.style.height = 'auto';
   sendBtn.disabled = true;
 
-  // Optimistic user bubble
+  // Optimistic user bubble + a live assistant element (three dots until tokens
+  // arrive; the poller fills it in and flips it to the cited answer when done).
   appendMessage('user', escapeHtml(text));
-  showThinking();
+  _liveAsstEl = _makeAssistantEl(null);
+  chatMessages.appendChild(_liveAsstEl);
+  _updateAssistantEl(_liveAsstEl, { status: 'streaming', content: '' });
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 
   // POST /enqueue {kind:chat, content, session_id}
   let rid, sid;
@@ -1171,7 +939,7 @@ async function sendQuestion() {
       session_id: sessionId || undefined,
     });
     if (status !== 200) {
-      removeThinking();
+      _liveAsstEl.remove(); _liveAsstEl = null;
       appendMessage('system', 'Error: could not enqueue question (' +
                     escapeHtml(JSON.stringify(json)) + ')');
       sendBtn.disabled = false;
@@ -1181,40 +949,31 @@ async function sendQuestion() {
     sid = json.session_id;
     sessionId = sid;
   } catch (e) {
-    removeThinking();
+    _liveAsstEl.remove(); _liveAsstEl = null;
     appendMessage('system', 'Network error: ' + escapeHtml(String(e)));
     sendBtn.disabled = false;
     return;
   }
 
-  // Remove "thinking" dots and start streaming bubble + fast history poller
-  removeThinking();
-  _startStreamingBubble();
+  // Drive the in-flight element from /history; /request is the error+timeout backup.
+  pendingRid = rid;
+  _finished = false;
   _startHistoryPoller(sid, rid);
 
-  // Poll GET /request?id=<rid> until done or error
-  pendingRid = rid;
   const deadline = Date.now() + ANSWER_TIMEOUT_MS;
-
   if (answerPoller) clearInterval(answerPoller);
   answerPoller = setInterval(async () => {
     if (Date.now() > deadline) {
-      clearInterval(answerPoller);
-      answerPoller = null;
-      pendingRid = null;
-      _stopHistoryPoller();
-      _removeStreamingBubble();
-      appendMessage('system', 'Timed out waiting for answer.');
-      sendBtn.disabled = false;
+      _finalize('Timed out waiting for answer.');
       return;
     }
     try {
       const { json: reqJson } = await apiFetch('GET', `/request?id=${encodeURIComponent(rid)}`);
-      const status = reqJson.status;
-      if (status === 'done' || status === 'error') {
-        // Backup path: the fast history poller usually collapses first; whichever
-        // wins, _finishAnswer runs exactly once.
-        _finishAnswer(sessionId, status === 'error' ? (reqJson.error || 'unknown') : null);
+      if (reqJson.status === 'done') {
+        await _pollOnce(sid, rid);   // ensure the final answer is rendered
+        _finalize();
+      } else if (reqJson.status === 'error') {
+        _finalize(reqJson.error || 'unknown');
       }
     } catch (e) {
       console.error('poll error', e);
@@ -1246,7 +1005,7 @@ newChatBtn.addEventListener('click', async () => {
     }
   }
   sessionId = null;
-  _streamingBubble = null;
+  _liveAsstEl = null;
   // Clear the UI
   const systemMsg = chatMessages.querySelector('.msg-system');
   chatMessages.innerHTML = '';

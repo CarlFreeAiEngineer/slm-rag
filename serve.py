@@ -267,6 +267,53 @@ def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) ->
     return pieces
 
 
+# Strip [A]/[B][C]/[12] citation markers from an answer before it is folded into
+# a retrieval query (they are noise to the embedder).
+_CITE_MARKER = re.compile(r"\[[A-Za-z0-9]+\]")
+
+# Cap how much of the previous answer we fold into the retrieval query, so a long
+# answer can't dominate the embedding (or overflow the embedder context).
+RETRIEVAL_CTX_ANSWER_CHARS = 1000
+
+
+def build_retrieval_query(question: str, prior_history: list[dict]) -> str:
+    """Build the string that is EMBEDDED for k-NN retrieval.
+
+    A follow-up like "Are they all male?" is meaningless to the embedder on its
+    own -- "they" has no referent, so retrieval matches the wrong thing (it once
+    pulled "orange cats are male" for a question about vampires).  To fix that we
+    prepend the most recent prior turn -- the previous question and the previous
+    CLEAN answer (citation markers stripped) -- so the embedded query carries the
+    conversation's current subject.  The previous answer is included (not just the
+    previous question) so a follow-up can also reference something the model just
+    SAID, e.g. "describe that type of sun".
+
+    Proven on real data: this flips the failing vampire follow-up from cat chunks
+    to the correct story chunks, and also sharpens retrieval contrast.
+
+    NOTE: this affects ONLY the retrieval query.  The generation prompt still uses
+    the bare question plus the history block (see build_prompt), so the model sees
+    the conversation normally.  A standalone first question (no prior turn) embeds
+    as-is.  Known trade-off: a clean topic switch that doesn't restate its subject
+    gets pulled toward the previous topic; accepted for now.
+    """
+    prev_user = next((m['content'] for m in reversed(prior_history)
+                      if m['role'] == 'user' and m.get('content')), None)
+    prev_asst_raw = next(((m.get('answer') or m.get('content')) for m in reversed(prior_history)
+                          if m['role'] == 'assistant' and (m.get('answer') or m.get('content'))), None)
+
+    parts = []
+    if prev_user:
+        parts.append(prev_user.strip())
+    if prev_asst_raw:
+        clean = _CITE_MARKER.sub('', prev_asst_raw)
+        clean = re.sub(r'\s+', ' ', clean).strip()[:RETRIEVAL_CTX_ANSWER_CHARS]
+        if clean:
+            parts.append(clean)
+    parts.append(question)
+    return ' '.join(parts)
+
+
 ##############################################################################
 # Hardware detection -- GPU VRAM for deciding Phi offload
 ##############################################################################
@@ -764,8 +811,21 @@ def _chat_worker():
         msg_id = None  # set in Step 4; used in error handler
 
         try:
-            # ── Step 1: embed the question (embed gate) ───────────────────────
-            prefixed = 'search_query: ' + question
+            # ── Step 0: load history first -- the retrieval query needs the
+            #    conversation's context so a follow-up ("Are they all male?")
+            #    retrieves the right thing instead of matching a stray word. ──
+            with _db_lock:
+                history = _db_mod.get_messages(_db_conn, session_id)
+            # Exclude the current user turn (last row) from history so the model
+            # does not see a duplicate of the question in the history block.
+            prior_history = [m for m in history if m['role'] != 'user' or
+                             m['content'] != question]
+
+            # ── Step 1: embed the CONTEXT-PREPENDED retrieval query (embed gate).
+            #    Only the embedding input is contextualized; the generation prompt
+            #    below still uses the bare question + history block. ──
+            retrieval_query = build_retrieval_query(question, prior_history)
+            prefixed = 'search_query: ' + retrieval_query
             log_event('embed_request', ip, 'WORKER', '/enqueue',
                       request_id=request_id, chat_session_id=session_id,
                       request_body=prefixed)
@@ -789,13 +849,7 @@ def _chat_worker():
                         meta['distance'] = distance
                         hits.append(meta)
 
-            # ── Step 3: build grounded prompt ─────────────────────────────────
-            with _db_lock:
-                history = _db_mod.get_messages(_db_conn, session_id)
-            # Exclude the current user turn (last row) from history so the model
-            # does not see a duplicate of the question in the history block.
-            prior_history = [m for m in history if m['role'] != 'user' or
-                             m['content'] != question]
+            # ── Step 3: build grounded prompt (bare question + history block) ──
             user_content = build_prompt(question, hits, prior_history)
             prompt_pieces = build_prompt_pieces(question, hits, prior_history)
 
@@ -815,7 +869,20 @@ def _chat_worker():
             # sleep between pieces so the browser sees the numbered chunks
             # appear one by one.  The browser polls /history at ~150-200ms so
             # this pace matches its rendering cadence.
-            accumulated = ''
+            # The message `content` is the VERBATIM transcript shown in the UI's
+            # expandable raw view: exactly what we send the model (system prompt +
+            # user turn) and exactly what it sends back, with obvious section
+            # boundaries.  Seed it with the system prompt, then stream the user
+            # turn piece by piece.
+            accumulated = (
+                '========== PROMPT SENT TO MODEL ==========\n\n'
+                '[SYSTEM]\n' + SYSTEM_PROMPT + '\n\n'
+                '[USER]\n'
+            )
+            with _db_lock:
+                _db_mod.update_message(
+                    _db_conn, msg_id, accumulated, status='streaming'
+                )
             for piece in prompt_pieces:
                 accumulated += piece
                 with _db_lock:
@@ -824,8 +891,8 @@ def _chat_worker():
                     )
                 time.sleep(_PROMPT_PIECE_SLEEP)
 
-            # Separator between prompt and generation output
-            accumulated += '\n\n--- Generating answer ---\n\n'
+            # Boundary between the prompt and the model's response
+            accumulated += '\n\n========== MODEL RESPONSE ==========\n\n'
             with _db_lock:
                 _db_mod.update_message(
                     _db_conn, msg_id, accumulated, status='streaming'
