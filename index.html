@@ -643,9 +643,20 @@ function renderTree(files) {
   dropHint.style.display = 'none';
   treeList.innerHTML = files.map(f => {
     const badgeClass = 'badge badge-' + (f.status || 'pending');
-    const badgeLabel = f.status === 'ready'
-      ? `ready · ${f.chunk_count} chunks`
-      : (f.status || 'pending');
+    let badgeLabel;
+    if (f.status === 'ready') {
+      badgeLabel = `ready · ${f.chunk_count} chunks`;
+    } else if (f.status === 'vectorizing') {
+      // chunk_count (n_chunks) is known once chunking finishes; embedded_count
+      // climbs toward it batch by batch. Show a % until the total is known.
+      const total = f.chunk_count || 0;
+      const done = f.embedded_count || 0;
+      badgeLabel = total > 0
+        ? `vectorizing · ${Math.floor((done / total) * 100)}% (${done}/${total})`
+        : 'vectorizing';
+    } else {
+      badgeLabel = f.status || 'pending';
+    }
     const trashSvg = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none"
       stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
@@ -799,12 +810,13 @@ function renderNumberedAnswer(answerText, references) {
   const refMap = {};
   (references || []).forEach(r => { refMap[r.n] = r; });
 
-  // Replace [N] patterns with clickable markers (but not [N] inside words)
-  const html = escapeHtml(answerText).replace(/\[(\d+)\]/g, (match, numStr) => {
-    const n = parseInt(numStr, 10);
-    const ref = refMap[n];
+  // Replace [L] letter-label patterns with clickable markers. Letters (not
+  // numbers) are used so the model can't confuse a document's own inline numbers
+  // for citations; only labels that map to a retrieved chunk become markers.
+  const html = escapeHtml(answerText).replace(/\[([A-Z]+)\]/g, (match, label) => {
+    const ref = refMap[label];
     if (!ref) return escapeHtml(match);
-    return `<span class="fn-marker" data-fn="${n}" title="Source: ${escapeHtml(ref.path)}, chunk ${ref.chunk_index}">${escapeHtml(match)}</span>`;
+    return `<span class="fn-marker" data-fn="${label}" title="Source: ${escapeHtml(ref.path)}, chunk ${ref.chunk_index}">${escapeHtml(match)}</span>`;
   });
   return html;
 }
@@ -823,10 +835,10 @@ function buildCollapsedBubble(answerText, references, buildContent, lastUserQues
   const refMap = {};
   (references || []).forEach(r => { refMap[r.n] = r; });
 
-  // Collect cited numbers from answer
+  // Collect cited letter labels from answer
   const cited = new Set();
-  (answerText.match(/\[(\d+)\]/g) || []).forEach(m => {
-    cited.add(parseInt(m.slice(1, -1), 10));
+  (answerText.match(/\[([A-Z]+)\]/g) || []).forEach(m => {
+    cited.add(m.slice(1, -1));
   });
 
   cited.forEach(n => {
@@ -852,7 +864,7 @@ function buildCollapsedBubble(answerText, references, buildContent, lastUserQues
       if (exp) {
         exp.classList.toggle('open');
         // Also highlight the source file in the tree
-        const ref = refMap[parseInt(n, 10)];
+        const ref = refMap[n];
         if (ref) {
           treeList.querySelectorAll('.tree-item').forEach(li => {
             li.classList.toggle('active', li.dataset.path === ref.path);

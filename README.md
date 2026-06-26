@@ -244,10 +244,11 @@ Two tiers, on purpose:
 `serve.py` installs `SIGINT`/`SIGTERM` handlers that **stop both `llama-server`
 subprocesses** (terminate, then kill on timeout) before exiting, so Ctrl-C never leaves
 orphaned model processes holding VRAM/RAM. For a clean remote stop it also exposes a
-**localhost-only** `/shutdown` endpoint: `POST /shutdown`, or `GET /shutdown?<UTC
-timestamp>` where the timestamp must be within 5 minutes (a guard so a stray or cached
-GET can't kill the server). Shutdown is **idempotent** -- the first request wins, drains
-the HTTP server, and frees the backends.
+**world-reachable** `/shutdown` endpoint (any client, not just localhost -- a portable
+personal tool you can stop from wherever it's exposed): `POST /shutdown`, or
+`GET /shutdown?<UTC timestamp>` where the timestamp must be within 5 minutes (a guard so
+a stray or cached GET can't kill the server). Shutdown is **idempotent** -- the first
+request wins, drains the HTTP server, and frees the backends.
 
 ---
 

@@ -36,7 +36,7 @@ P2 chunker ───────────────────────
 **Build.** `serve.py` that boots with no models: arg parsing (`--web` / `--cli` /
 `--port` / `--check` / `--help`, defaults baked in, **no env vars**); binds `51548`;
 serves a placeholder `index.html`; `GET /health` returns JSON; `SIGINT`/`SIGTERM`
-handlers + localhost-only `/shutdown` (`POST`, and `GET` with the within-5-min timestamp
+handlers + world-reachable `/shutdown` (`POST`, and `GET` with the within-5-min timestamp
 guard); the `./logs/` JSONL writer stamping every line with a **request id** and a **chat
 session id**. Backends are stubbed; `--check` prints the planned backend layout and exits.
 

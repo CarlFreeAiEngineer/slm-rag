@@ -347,9 +347,9 @@ def run_fallback_test(base_url, reason):
         import re as _re
         check('answer mentions k-means',
               IN_CORPUS_EXPECTED.lower() in answer.lower(), answer[:120])
-        # New numbered citation format: [1], [2], etc.
-        check('answer contains numbered [N] citation',
-              bool(_re.search(r'\[\d+\]', answer)), answer[:200])
+        # Letter citation format: [A], [B], etc.
+        check('answer contains [L] letter citation',
+              bool(_re.search(r'\[[A-Z]+\]', answer)), answer[:200])
         check('references field present in history message',
               last_asst.get('references') is not None, str(last_asst.get('references', ''))[:80])
         check('build transcript (content) longer than collapsed answer',
@@ -479,10 +479,10 @@ def run_playwright_test(base_url):
             answer_rendered = page.query_selector('.msg-assistant') is not None
         check('collapsed answer-view rendered', answer_rendered)
 
-        # 6. Assert a [N] numbered footnote marker is present and clickable
-        print('\n[check] Numbered footnote marker')
+        # 6. Assert a [L] letter footnote marker is present and clickable
+        print('\n[check] Letter footnote marker')
         fn_marker = page.query_selector('.fn-marker')
-        check('[N] numbered footnote marker present', fn_marker is not None)
+        check('[L] letter footnote marker present', fn_marker is not None)
 
         if fn_marker:
             # Click the footnote marker and verify inline expander opens

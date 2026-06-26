@@ -74,7 +74,7 @@ BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 
 # Default listen port.  --port is the ONLY override; there is no env var.
 DEFAULT_PORT = 51548
-HOST         = '0.0.0.0'     # bind all interfaces (LAN-accessible); /shutdown stays localhost-only
+HOST         = '0.0.0.0'     # bind all interfaces (LAN-accessible); /shutdown is world-reachable
 
 # Model ports (fixed; no flags needed -- each model is always on the same port)
 PHI_PORT    = 52851
@@ -108,9 +108,14 @@ DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
 # fine-tuning and serving share the same template so the model reinforces the
 # grounded, cited behaviour that the server expects here.
 #
-# Citation format: [N] where N is the 1-based index of the numbered data chunk.
-# Chunks are numbered [1]..[N] in retrieval order (most relevant first).
-# The model is instructed to cite chunks by number, e.g. [1] or [2][3].
+# Citation format: [L] where L is a LETTER label (A, B, C, ...) assigned to each
+# data chunk in retrieval order (most relevant first).  Letters are used instead
+# of numbers deliberately: documents are full of bare integers (years, counts,
+# enumerated lists), and a numeric [N] citation scheme let the model confuse a
+# document's own inline numbers for citations -- it would echo "[3][4]" from a
+# numbered fact list instead of citing the actual chunk.  A letter namespace is
+# disjoint from numeric document content, so a stray "[A]" never occurs in data.
+# The model is instructed to cite chunks by letter, e.g. [A] or [B][C].
 # The "I don't know" phrase is fixed so tests can match it reliably.
 #
 # DESIGN (chosen from the Colab model x prompt eval, 2025-06):
@@ -125,10 +130,10 @@ DEFAULT_DB = os.path.join(BASE_DIR, 'rag.db')
 ##############################################################################
 
 SYSTEM_PROMPT = (
-    "You answer using ONLY the numbered chunks below. "
+    "You answer using ONLY the labelled chunks below. "
     "The answer may be stated indirectly, in narration or dialogue -- extract it and state it plainly "
     "in 1-3 sentences in your own words. "
-    "Cite the chunk number(s) you used like [1] or [2][3]. "
+    "Cite the chunk label(s) you used like [A] or [B][C]. "
     "Only if none of the chunks are relevant, reply with exactly: "
     "\"I don't know based on the provided documents.\""
 )
@@ -149,11 +154,26 @@ PROMPT_TURNS = 3
 CHAT_TOP_K = 8
 
 
+def chunk_label(i: int) -> str:
+    """Map a 1-based chunk position to its citation letter: 1->A, 26->Z, 27->AA.
+
+    Letters form the citation namespace (see the SYSTEM_PROMPT comment): unlike
+    numbers, they cannot collide with the bare integers that live inside document
+    text, so the model can't mistake a document's own inline numbers for a cite.
+    """
+    label = ''
+    while i > 0:
+        i, rem = divmod(i - 1, 26)
+        label = chr(ord('A') + rem) + label
+    return label
+
+
 def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
     """Assemble the user-turn content that is sent to Phi alongside SYSTEM_PROMPT.
 
-    Context chunks are numbered [1]..[N] in retrieval order (most relevant first).
-    The model cites chunks by number (e.g. [1] or [2][3]).
+    Context chunks are labelled [A]..[Z] in retrieval order (most relevant first).
+    The model cites chunks by letter (e.g. [A] or [B][C]).  Letters, not numbers,
+    so the model can't confuse a document's own inline integers for citations.
 
     DESIGN: The full grounding instruction lives in SYSTEM_PROMPT only.  The
     user turn contains numbered chunks + bare "Question: ..." with NO repeated
@@ -176,14 +196,14 @@ def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:
     Returns
     -------
     The string to use as the 'user' role content in the chat completion request.
-    Numbered chunks appear first ([1] = most relevant), then the bare Question
+    Labelled chunks appear first ([A] = most relevant), then the bare Question
     line.  No instruction footer -- the instruction lives solely in SYSTEM_PROMPT.
     """
-    # Build numbered context chunks: [1] = most relevant (retrieval order).
+    # Build labelled context chunks: [A] = most relevant (retrieval order).
     chunk_lines = []
     for i, hit in enumerate(hits, start=1):
         chunk_lines.append(
-            f"[{i}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}"
+            f"[{chunk_label(i)}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}"
         )
     context_block = '\n\n'.join(chunk_lines) if chunk_lines else '[no context retrieved]'
 
@@ -216,7 +236,7 @@ def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) ->
 
     Pieces (in order):
       1. History block (if any) -- one piece
-      2. Each numbered chunk [1]..[N] -- one piece per chunk
+      2. Each labelled chunk [A]..[Z] -- one piece per chunk
       3. Bare question -- one piece (no instruction footer; instruction is in SYSTEM_PROMPT)
 
     The caller streams these into the DB one by one with a small sleep between
@@ -235,10 +255,10 @@ def build_prompt_pieces(question: str, hits: list[dict], history: list[dict]) ->
             lines.append(f"{prefix}: {content}")
         pieces.append('\n'.join(lines) + '\n\n')
 
-    # Numbered chunks (most relevant first)
+    # Labelled chunks (most relevant first)
     for i, hit in enumerate(hits, start=1):
         pieces.append(
-            f"[{i}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}\n\n"
+            f"[{chunk_label(i)}] (source: {hit['path']}, chunk {hit['chunk_index']})\n{hit['text']}\n\n"
         )
 
     # Bare question -- no instruction footer (instruction lives solely in SYSTEM_PROMPT).
@@ -682,7 +702,7 @@ def _ingest_background(doc_id: int, rel_path: str, request_id: str):
 # Flow for each chat request:
 #   1. Embed the question (embed gate, 'search_query: ' prefix).
 #   2. k-NN retrieval (no gate -- pure SQLite).
-#   3. Build grounded prompt pieces (numbered [1]..[N] chunks, most relevant first).
+#   3. Build grounded prompt pieces (labelled [A]..[Z] chunks, most relevant first).
 #   4. Insert streaming assistant message row (content='', status='streaming').
 #   5a. PACED PROMPT STREAMING: write each prompt piece into content with a
 #       small time.sleep(~0.12) so the browser sees the prompt build up visually.
@@ -881,10 +901,12 @@ def _chat_worker():
                       response_body=reply or '')
 
             # ── Step 6: mark done, store clean answer + references ────────────
-            # Build numbered references list matching the chunks used in the prompt.
+            # Build the references list matching the chunks used in the prompt.
+            # 'n' carries the LETTER label (A, B, ...) that the model cites, so it
+            # lines up with the [A]/[B] markers in the answer text.
             refs = [
                 {
-                    'n':           i,
+                    'n':           chunk_label(i),
                     'path':        hit['path'],
                     'chunk_index': hit['chunk_index'],
                     'text':        hit['text'],
@@ -2058,9 +2080,13 @@ class RagHandler(SimpleHTTPRequestHandler):
         """GET /tree -- return the ingested corpus as JSON.
 
         Returns a list of file entries under ragdocs/, each with:
-            path        : relative path under ragdocs/
-            status      : 'vectorizing' | 'ready' | 'error' | 'pending'
-            chunk_count : number of stored chunks (from DB n_chunks column)
+            path           : relative path under ragdocs/
+            status         : 'vectorizing' | 'ready' | 'error' | 'pending'
+            chunk_count    : total chunks for this doc (from DB n_chunks column)
+            embedded_count : chunks already embedded + stored so far. While a doc
+                             is 'vectorizing', n_chunks is the known total and
+                             embedded_count climbs toward it batch by batch, so
+                             the UI can show embedded_count/chunk_count progress.
         """
         ip = self.client_address[0]
         if _db_conn is None:
@@ -2069,22 +2095,27 @@ class RagHandler(SimpleHTTPRequestHandler):
 
         try:
             with _db_lock:
+                # Correlated subquery yields how many chunk rows are already
+                # stored per doc -- the embedded-so-far count that drives the
+                # vectorizing progress indicator.
                 rows = _db_conn.execute(
-                    "SELECT path, status, n_chunks, byte_size, ext "
-                    "FROM documents ORDER BY path"
+                    "SELECT d.path, d.status, d.n_chunks, d.byte_size, d.ext, "
+                    "       (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id) "
+                    "FROM documents d ORDER BY d.path"
                 ).fetchall()
         except Exception as e:
             self._json_response({'error': str(e)}, 500, request_id=request_id)
             return
 
         files = []
-        for path, status, n_chunks, byte_size, ext in rows:
+        for path, status, n_chunks, byte_size, ext, embedded_count in rows:
             files.append({
-                'path':        path,
-                'status':      status,
-                'chunk_count': n_chunks or 0,
-                'byte_size':   byte_size,
-                'ext':         ext,
+                'path':           path,
+                'status':         status,
+                'chunk_count':    n_chunks or 0,
+                'embedded_count': embedded_count or 0,
+                'byte_size':      byte_size,
+                'ext':            ext,
             })
 
         self._json_response({'files': files}, 200, request_id=request_id)
@@ -2511,16 +2542,14 @@ class RagHandler(SimpleHTTPRequestHandler):
                             status_code, request_id=request_id)
 
     def _handle_shutdown(self, method, query, request_id):
-        """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>."""
-        ip = self.client_address[0]
-        if ip not in ('127.0.0.1', '::1'):
-            self._json_response(
-                {'error': 'Shutdown is only allowed from localhost'}, 403,
-                request_id=request_id)
-            log_event('http_response', ip, method, '/shutdown',
-                      request_id=request_id, status=403)
-            return
+        """POST /shutdown (unconditional) or GET /shutdown?<UTC-timestamp>.
 
+        Intentionally reachable from any client (not just localhost): this is a
+        portable personal tool and the operator wants to be able to stop it from
+        anywhere it is exposed.  POST is unconditional; GET still requires a
+        fresh UTC timestamp so a stray crawler/prefetch GET cannot kill it.
+        """
+        ip = self.client_address[0]
         if method == 'GET':
             ok, ts = fresh_shutdown_timestamp(query)
             if not ok:
@@ -2762,7 +2791,7 @@ def cli_repl(base_url):
         last_asst = asst_msgs[-1]
         answer = (last_asst.get('answer') or last_asst.get('content', '')).strip()
         # Print the answer with a blank line above and below for readability.
-        # Numbered citations [1][2] are embedded in the answer text by the prompt.
+        # Letter citations [A][B] are embedded in the answer text by the prompt.
         print(f'\n{answer}\n', flush=True)
 
         # Expand numbered citations into [Source: ...] lines so the terminal

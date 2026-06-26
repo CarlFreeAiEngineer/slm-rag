@@ -18,8 +18,8 @@ What it checks:
      b. While polling GET /request?id=<rid>: assert message `content` GROWS
         (non-empty mid-stream, larger when polled again later).
      c. On done: assert status='done', `answer` is non-empty, `answer` contains
-        a fact from sample.md ('k-means'), `answer` contains at least one [N]
-        citation (e.g. [1] or [2]), and `references` is valid JSON with
+        a fact from sample.md ('k-means'), `answer` contains at least one [L]
+        letter citation (e.g. [A] or [B]), and `references` is valid JSON with
         numbered chunk objects.
      d. `content` (the full build transcript) is longer than `answer`.
   4. Out-of-corpus question (capital of France -- not in sample.md):
@@ -434,13 +434,13 @@ def main():
                 f'answer[:200]: {ans[:200]!r}',
             )
 
-            # (d) answer contains at least one [N] citation.
+            # (d) answer contains at least one [L] letter citation.
             import re
-            numbered_citation = re.compile(r'\[\d+\]')
-            has_numbered = bool(numbered_citation.search(ans))
+            letter_citation = re.compile(r'\[[A-Z]+\]')
+            has_citation = bool(letter_citation.search(ans))
             check(
-                'in-corpus answer contains [N] numbered citation',
-                has_numbered,
+                'in-corpus answer contains [L] letter citation',
+                has_citation,
                 f'answer[:300]: {ans[:300]!r}',
             )
 
