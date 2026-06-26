@@ -589,6 +589,13 @@ const previewClose   = document.getElementById('preview-close');
 
 // ── Utilities ──────────────────────────────────────────────────
 
+// Base path this page was served from, so all API calls work whether the app
+// is mounted at the server root (http://localhost:51548/) or behind a path-
+// prefix reverse proxy (e.g. https://host/qube/51548/). The frontend uses
+// root-style paths like '/tree'; we prepend this prefix to keep them relative
+// to wherever index.html actually lives.  '/' -> '',  '/qube/51548/' -> '/qube/51548'.
+const API_BASE = location.pathname.replace(/[^/]*$/, '').replace(/\/$/, '');
+
 async function apiFetch(method, path, body, isFormData) {
   const opts = { method };
   if (body !== undefined && body !== null) {
@@ -599,7 +606,7 @@ async function apiFetch(method, path, body, isFormData) {
       opts.body = JSON.stringify(body);
     }
   }
-  const resp = await fetch(path, opts);
+  const resp = await fetch(API_BASE + path, opts);
   const text = await resp.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { _raw: text }; }
