@@ -18,11 +18,12 @@ extract_text(path) -> str
     Read supported files (.txt, .md, .pdf) and return plain UTF-8 text.
     Raises ValueError for unsupported extensions.
 
-chunk_text(text, target_chars=2200, overlap_paras=1) -> list[dict]
-    Paragraph-aware chunker (~2200 chars + 1-para overlap).
-    Chosen from the Colab A100 chunking sweep: keeps dialogue/Q&A exchanges
-    intact so the small model can extract an answer stated indirectly,
-    while keeping retrieval discrimination sharp.
+chunk_text(text, target_chars=1500, overlap_paras=1) -> list[dict]
+    Paragraph-aware chunker (~1500 chars + 1-para overlap).
+    Smaller chunks keep each embedding focused on a single topic, so k-NN
+    retrieval is sharper and less off-topic text lands in the prompt -- which
+    matters for a small (7B) generator.  Whole paragraphs are kept together so
+    a Q&A exchange or an indirectly-stated answer isn't split mid-thought.
 
     Each dict has:
         chunk_index : int   -- 0-based position in the chunk sequence
@@ -44,6 +45,17 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Chunking defaults -- SINGLE SOURCE OF TRUTH
+# ---------------------------------------------------------------------------
+# This is THE chunk-size knob.  chunk_text() takes these as its defaults, and
+# serve.py ingests through that default, so changing the value here changes the
+# operative behaviour everywhere.  Tests and any caller should reference these
+# names rather than hard-coding a copy of the number.
+DEFAULT_TARGET_CHARS  = 1500   # target chunk length in chars (~375 tokens of prose)
+DEFAULT_OVERLAP_PARAS = 1      # tail paragraphs carried into the next chunk as overlap
 
 
 # ---------------------------------------------------------------------------
@@ -128,16 +140,19 @@ def extract_text(path: str | Path) -> str:
 
 def chunk_text(
     text: str,
-    target_chars: int = 2200,
-    overlap_paras: int = 1,
+    target_chars: int = DEFAULT_TARGET_CHARS,
+    overlap_paras: int = DEFAULT_OVERLAP_PARAS,
 ) -> list[dict[str, Any]]:
     """
-    Paragraph-aware chunker: ~2200 chars + 1-para overlap.
+    Paragraph-aware chunker: ~1500 chars + 1-para overlap.
 
-    Chosen from the Colab A100 chunking sweep (2025-06): keeping whole
-    paragraphs together preserves dialogue / Q&A exchanges so the small
-    model can extract an answer stated indirectly, while keeping chunks
-    short enough (< 2048 embedder tokens) for sharp retrieval.
+    Smaller chunks keep each chunk's embedding focused on one topic, so k-NN
+    retrieval is sharper and less off-topic text is stuffed into the prompt --
+    important for a small (7B) generator.  Whole paragraphs are still kept
+    together so a dialogue / Q&A exchange or an indirectly-stated answer isn't
+    split mid-thought.  (Note: the actual emitted chunks run somewhat above the
+    target -- it packs whole paragraphs until length crosses the target, then
+    adds the overlap paragraph -- so a 1500 target yields ~1.5-2k-char chunks.)
 
     Strategy
     --------
@@ -146,7 +161,7 @@ def chunk_text(
     2. Greedily accumulate consecutive paragraphs until the accumulated
        length >= target_chars, then emit a chunk.  Carry the last
        *overlap_paras* paragraphs forward into the next chunk.
-    3. If a single paragraph alone exceeds ~1.5 * target_chars (3300 chars
+    3. If a single paragraph alone exceeds ~1.5 * target_chars (2250 chars
        by default), sentence-split THAT paragraph (regex ``(?<=[.!?])\\s+``)
        and pack its sentences to the target so no chunk is enormous.
     4. Track exact char_start / char_end offsets into the original *text*
@@ -155,8 +170,8 @@ def chunk_text(
     Parameters
     ----------
     text          : the full document text
-    target_chars  : target chunk length in characters (default 2200,
-                    ~500-600 tokens on typical English prose)
+    target_chars  : target chunk length in characters (default 1500,
+                    ~375 tokens on typical English prose)
     overlap_paras : number of tail paragraphs carried into the next chunk
                     as overlap (default 1)
 
@@ -170,7 +185,7 @@ def chunk_text(
 
     SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
     PARA_SPLIT     = re.compile(r'\n\s*\n')
-    MAX_PARA_CHARS = int(target_chars * 1.5)   # ~3300 chars -- split if exceeded
+    MAX_PARA_CHARS = int(target_chars * 1.5)   # ~2250 chars -- split if exceeded
 
     # ------------------------------------------------------------------ #
     # Step 1: locate paragraph spans in the original text.               #

@@ -139,7 +139,10 @@ SYSTEM_PROMPT = (
 PROMPT_TURNS = 3
 
 # Default number of chunks to retrieve for each chat question.
-CHAT_TOP_K = 5
+# Lowered 5 -> 3: actual chunks average ~3.1k chars (~790 tok), so 5 chunks put
+# ~3.9k tokens of often-noisy context in the prompt.  3 keeps the prompt tighter
+# and retrieval sharper for the 7B model without dropping the eval-chosen chunk shape.
+CHAT_TOP_K = 3
 
 
 def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:

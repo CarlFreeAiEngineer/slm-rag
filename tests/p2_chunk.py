@@ -11,9 +11,8 @@ tests/p2_chunk.py -- Phase P2 acceptance test.
 Plain Python script; no pytest.  Prints what it checks; exits 0 on full
 pass, non-zero if any assertion fails.
 
-Tests the paragraph-aware chunk_text() introduced in the Colab A100 chunking
-sweep (2025-06): ~2200-char chunks + 1-para overlap, blank-line paragraph
-boundaries, sentence-split for oversized paragraphs.
+Tests the paragraph-aware chunk_text(): ~1500-char chunks + 1-para overlap,
+blank-line paragraph boundaries, sentence-split for oversized paragraphs.
 
 Run with:
     bin\\uv.exe run tests\\p2_chunk.py          (from the project root on Windows)
@@ -65,12 +64,12 @@ def section(title: str) -> None:
 # ---------------------------------------------------------------------------
 # Known sentences placed deliberately in the sample files.
 #
-# With the paragraph-aware ~2200-char chunker, sample.txt's first chunk
+# With the paragraph-aware ~1500-char chunker, sample.txt's first chunk
 # covers the opening paragraphs including the CAP theorem paragraph, so
 # the known sentence lands in chunk 0.
 #
 # sample.md: K-means paragraph follows multiple supervised-learning paragraphs
-# that together exceed 2200 chars, so K-means lands in chunk 1.
+# that together exceed 1500 chars, so K-means lands in chunk 1.
 # ---------------------------------------------------------------------------
 KNOWN_TXT_SENTENCE = (
     "The CAP theorem, formulated by Eric Brewer in 2000, states that a "
@@ -83,9 +82,11 @@ KNOWN_MD_SENTENCE = (
 )
 KNOWN_MD_CHUNK = 1  # expected 0-based chunk index (paragraph-aware chunker)
 
-# Paragraph-aware chunker targets ~2200 chars.  Chunks may vary somewhat
-# depending on paragraph boundaries; we check that the target is roughly met.
-TARGET_CHARS = 2200
+# Paragraph-aware chunker target (chars).  Single source of truth lives in
+# ingest_lib; the test references it so changing the knob never breaks this test.
+# Chunks may vary somewhat with paragraph boundaries; we check the target is
+# roughly met.
+TARGET_CHARS = ingest_lib.DEFAULT_TARGET_CHARS
 # Paragraph-aware chunks may be smaller when approaching document end;
 # only check that chunks at least 2 before the last are >= 50% of target.
 # This avoids false failures on short trailing paragraphs.
@@ -355,7 +356,7 @@ def test_unsupported_extension() -> None:
 def test_chunk_text_unit() -> None:
     """Unit tests for chunk_text() directly, independent of file I/O.
 
-    Tests the paragraph-aware chunker (target_chars=2200, overlap_paras=1).
+    Tests the paragraph-aware chunker (target_chars=1500, overlap_paras=1).
     """
     section("chunk_text() unit tests -- paragraph-aware chunker")
 
@@ -363,7 +364,7 @@ def test_chunk_text_unit() -> None:
     # Test 1: multi-paragraph text produces multiple chunks + roundtrip   #
     # ------------------------------------------------------------------ #
     # Build text with ~10 paragraphs each ~350 chars (~3500 chars/para x 10).
-    # With target_chars=2200 we expect roughly 4-6 chunks on 10 paras.
+    # With target_chars=1500 we expect a handful of chunks on 10 paras.
     paras = []
     for i in range(10):
         # Each paragraph is ~350 chars.
@@ -372,7 +373,7 @@ def test_chunk_text_unit() -> None:
         )
     text = "\n\n".join(paras)
 
-    chunks = ingest_lib.chunk_text(text, target_chars=2200, overlap_paras=1)
+    chunks = ingest_lib.chunk_text(text)   # exercise the real defaults
     check("unit: multiple chunks for 10 paragraphs", len(chunks) > 1, f"got {len(chunks)}")
 
     # All char offsets should recover the chunk text.
@@ -463,7 +464,7 @@ def main() -> int:
 
     print("=" * 60)
     print("  slm-rag P2 -- text extraction + chunking tests")
-    print("  (paragraph-aware chunker, ~2200 chars + 1-para overlap)")
+    print("  (paragraph-aware chunker, ~1500 chars + 1-para overlap)")
     print("=" * 60)
 
     test_txt(samples_dir)
