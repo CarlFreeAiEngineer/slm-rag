@@ -1198,7 +1198,9 @@ class InProcEmbedBackend:
         print('[serve] embedder ready (in-process, CPU)', flush=True)
         return True
 
-    def embed(self, text):
+    def embed(self, text, timeout=None):
+        # timeout is accepted for signature parity with ProxyBackend.embed (which
+        # uses it for the HTTP call); in-process embedding has no socket to time out.
         return InProcEmbedBackend._llm.embed(text)
 
     def stop(self):
