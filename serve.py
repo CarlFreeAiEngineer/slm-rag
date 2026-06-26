@@ -74,7 +74,7 @@ BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 
 # Default listen port.  --port is the ONLY override; there is no env var.
 DEFAULT_PORT = 51548
-HOST         = '127.0.0.1'   # localhost-only; slm-rag is a personal desktop app
+HOST         = '0.0.0.0'     # bind all interfaces (LAN-accessible); /shutdown stays localhost-only
 
 # Model ports (fixed; no flags needed -- each model is always on the same port)
 PHI_PORT    = 52851
