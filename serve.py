@@ -1196,6 +1196,7 @@ class InProcEmbedBackend:
             verbose=False,
         )
         print('[serve] embedder ready (in-process, CPU)', flush=True)
+        return True
 
     def embed(self, text):
         return InProcEmbedBackend._llm.embed(text)
@@ -1226,6 +1227,7 @@ class InProcGenBackend:
             verbose=False,
         )
         print(f'[serve] phi ready (in-process, {where})', flush=True)
+        return True
 
     def generate(self, prompt, max_tokens=256, temperature=0.7, top_p=0.9):
         result = InProcGenBackend._llm.create_chat_completion(
