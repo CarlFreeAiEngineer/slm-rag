@@ -68,8 +68,8 @@ correct in the portable runtime.
 ## P2 -- Text extraction + chunking *(independent, pure)*
 
 **Build.** A module: file -> plain text (`.txt`, `.md`, `.pdf` via `pypdf`) -> chunks
-(~512 tokens, ~64 overlap), each with metadata for citations (source path, chunk index,
-char offsets).
+(paragraph-aware, ~1500 chars / ~375 tokens with 1-paragraph overlap), each with
+metadata for citations (source path, chunk index, char offsets).
 
 **Test.** `python ingest_lib.py samples/notes.pdf` prints N chunks; assert chunk
 size/overlap are within tolerance and that a known sentence lands in the expected chunk
