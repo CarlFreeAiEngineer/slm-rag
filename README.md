@@ -43,10 +43,13 @@ better at using it.**
    `rag.db`** -- there is no `ragdocs/` directory, so status, content, and deletion all
    live in one row (no OS file locking). Supported in v1: **`.txt`, `.md`, `.pdf`**
    (PDF text via `pypdf`). More types later.
-2. **Extract** plain text from the stored blob, **chunk** it (paragraph-aware, ~1500
-   chars / ~375 tokens per chunk with one paragraph of overlap; oversized paragraphs are
-   sentence-split), and **embed** each chunk with **nomic-embed-text v1.5** (768-dim)
-   running as a small GGUF on the bundled `llama.cpp`.
+2. **Extract** plain text from the stored blob, **chunk** it (paragraph-aware, ~250-char
+   target so chunks land ~390 chars / ~95 tokens with one paragraph of overlap;
+   paragraphs longer than 1.5x the target are sentence-split -- small, focused chunks
+   keep each embedding about one idea so a buried sentence still surfaces in retrieval),
+   and **embed** each chunk
+   with **nomic-embed-text v1.5** (768-dim) running as a small GGUF on the bundled
+   `llama.cpp`.
 3. **Store** the document blob, its chunks, and their vectors in **one SQLite file** using
    the [`sqlite-vec`](https://github.com/asg017/sqlite-vec) extension (a `vec0` virtual
    table). The whole corpus is one portable file -- nothing else to run, and deleting a
@@ -56,7 +59,8 @@ better at using it.**
 1. The question is embedded with the same model.
 2. **`sqlite-vec` k-NN** returns the top matching chunks (brute-force, exact -- plenty
    fast for a personal corpus), optionally scoped to a folder/file. The chat uses the
-   top **3** chunks (`CHAT_TOP_K`).
+   top **8** chunks (`CHAT_TOP_K`) -- with small focused chunks, more of them are needed
+   to give the model enough grounding (~8 x ~390c ~= 3k chars of context).
 3. Those chunks are stuffed into a grounded prompt for **Qwen2.5-7B-Instruct** (served by
    `llama.cpp`), which answers using only the supplied context and **cites its
    sources**, or says it doesn't know when the answer isn't there.

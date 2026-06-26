@@ -139,10 +139,14 @@ SYSTEM_PROMPT = (
 PROMPT_TURNS = 3
 
 # Default number of chunks to retrieve for each chat question.
-# Lowered 5 -> 3: actual chunks average ~3.1k chars (~790 tok), so 5 chunks put
-# ~3.9k tokens of often-noisy context in the prompt.  3 keeps the prompt tighter
-# and retrieval sharper for the 7B model without dropping the eval-chosen chunk shape.
-CHAT_TOP_K = 3
+# With small (~250-char target, ~386c emitted) chunks each vector is focused, so a
+# single buried sentence actually surfaces -- but one small chunk is too little
+# context for the model to answer from.  8 chunks (~8 x ~386c ~= 3.1k chars)
+# restores enough grounding while keeping retrieval sharp.  (A diagnostic showed
+# the answer chunk for "do vampires drive?" ranked 8th at the old ~1.5k-char size
+# -- invisible at k=3.  At ~386c the "Wings -- large, leathery, more bat than
+# bird" sentence becomes its own top-1 hit; large chunks buried it entirely.)
+CHAT_TOP_K = 8
 
 
 def build_prompt(question: str, hits: list[dict], history: list[dict]) -> str:

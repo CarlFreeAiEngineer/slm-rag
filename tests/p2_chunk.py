@@ -11,7 +11,7 @@ tests/p2_chunk.py -- Phase P2 acceptance test.
 Plain Python script; no pytest.  Prints what it checks; exits 0 on full
 pass, non-zero if any assertion fails.
 
-Tests the paragraph-aware chunk_text(): ~1500-char chunks + 1-para overlap,
+Tests the paragraph-aware chunk_text(): target-sized chunks + 1-para overlap,
 blank-line paragraph boundaries, sentence-split for oversized paragraphs.
 
 Run with:
@@ -64,12 +64,13 @@ def section(title: str) -> None:
 # ---------------------------------------------------------------------------
 # Known sentences placed deliberately in the sample files.
 #
-# With the paragraph-aware ~1500-char chunker, sample.txt's first chunk
+# With the paragraph-aware chunker, sample.txt's first chunk
 # covers the opening paragraphs including the CAP theorem paragraph, so
 # the known sentence lands in chunk 0.
 #
-# sample.md: K-means paragraph follows multiple supervised-learning paragraphs
-# that together exceed 1500 chars, so K-means lands in chunk 1.
+# sample.md: the K-means paragraph follows several supervised-learning paragraphs
+# that span more than one chunk, so K-means lands a few chunks in (exact index
+# depends on the target).
 # ---------------------------------------------------------------------------
 KNOWN_TXT_SENTENCE = (
     "The CAP theorem, formulated by Eric Brewer in 2000, states that a "
@@ -93,8 +94,12 @@ TARGET_CHARS = ingest_lib.DEFAULT_TARGET_CHARS
 TOLERANCE = 0.50   # chunks (excluding last 2) should be >= 50% of target_chars
 
 # Minimum overlap in chars between consecutive chunks (1-para overlap).
-# One paragraph in sample.txt is typically 300-800 chars.
-MIN_OVERLAP_CHARS = 50
+# The overlap is exactly one paragraph, so its size tracks paragraph length, not
+# the chunk target.  At a section boundary the carried paragraph can be just a
+# short Markdown heading (e.g. "### Model Evaluation", ~20 chars), which is still
+# a valid 1-paragraph overlap -- so the floor only asserts that consecutive chunks
+# genuinely share a paragraph, not a target-proportional amount.
+MIN_OVERLAP_CHARS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +361,7 @@ def test_unsupported_extension() -> None:
 def test_chunk_text_unit() -> None:
     """Unit tests for chunk_text() directly, independent of file I/O.
 
-    Tests the paragraph-aware chunker (target_chars=1500, overlap_paras=1).
+    Tests the paragraph-aware chunker at the default target (DEFAULT_TARGET_CHARS).
     """
     section("chunk_text() unit tests -- paragraph-aware chunker")
 
@@ -364,7 +369,7 @@ def test_chunk_text_unit() -> None:
     # Test 1: multi-paragraph text produces multiple chunks + roundtrip   #
     # ------------------------------------------------------------------ #
     # Build text with ~10 paragraphs each ~350 chars (~3500 chars/para x 10).
-    # With target_chars=1500 we expect a handful of chunks on 10 paras.
+    # At the default target we expect multiple chunks on 10 paras.
     paras = []
     for i in range(10):
         # Each paragraph is ~350 chars.
@@ -464,7 +469,7 @@ def main() -> int:
 
     print("=" * 60)
     print("  slm-rag P2 -- text extraction + chunking tests")
-    print("  (paragraph-aware chunker, ~1500 chars + 1-para overlap)")
+    print("  (paragraph-aware chunker, target-sized chunks + 1-para overlap)")
     print("=" * 60)
 
     test_txt(samples_dir)
