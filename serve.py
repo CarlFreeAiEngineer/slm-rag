@@ -261,10 +261,10 @@ def nvidia_vram_gb():
 
 GPU_TOTAL_GB, GPU_FREE_GB = nvidia_vram_gb()
 
-# Headroom over weight size for KV cache + compute buffers at 8192 context.
-# Measured on Phi-4-mini Q4_K_M: KV 1024 MiB + compute 416 MiB ~= 1.41 GiB at 8192,
-# so 1.6 GiB reserves a small margin (at 4096 it was ~0.9 GiB under a 1.3 cap).
-GPU_HEADROOM_GB = 1.6
+# Headroom over GPU weight size for KV cache + compute buffers at 8192 context.
+# Measured on Qwen2.5-7B Q4_K_M: KV 448 MiB + compute 494 MiB ~= 0.93 GiB at 8192
+# (small KV thanks to 4-head GQA); 1.2 GiB reserves a ~0.27 GiB cushion.
+GPU_HEADROOM_GB = 1.2
 
 
 def gpu_layers_for_phi():
@@ -273,7 +273,7 @@ def gpu_layers_for_phi():
 
     Rules (no env var override -- slm-rag uses flags only):
       macOS   -> '99' (Apple Metal, unified memory)
-      NVIDIA  -> '99' if Phi (~2.4 GB + headroom) fits in free VRAM, else '0'
+      NVIDIA  -> '99' if the gen model (~4.1 GB GPU weights + headroom) fits in free VRAM, else '0'
       no GPU  -> '0'
 
     The free reading is taken AFTER reap_orphan_backends() (see main()), which kills
@@ -286,8 +286,10 @@ def gpu_layers_for_phi():
         return '99'
     if GPU_FREE_GB is None:
         return '0'           # no NVIDIA GPU detected
-    phi_need = 2.4 + GPU_HEADROOM_GB
-    return '99' if phi_need <= GPU_FREE_GB else '0'
+    # Qwen2.5-7B Q4_K_M puts ~4.07 GiB of weights on the GPU (token_embd stays on CPU);
+    # GPU_HEADROOM_GB covers the ~0.93 GiB KV+compute at 8192 ctx. ~5.0 GiB total fits 6 GB.
+    gen_need = 4.1 + GPU_HEADROOM_GB
+    return '99' if gen_need <= GPU_FREE_GB else '0'
 
 
 ##############################################################################
@@ -374,14 +376,20 @@ HF_WEIGHTS = {
         'approx_gb': 0.08,   # ~80 MB
     },
     'phi': {
-        # The UNCUSTOMIZED base Phi-4-mini-instruct (MIT). slm-rag starts uncustomized
-        # and fine-tunes on its own RAG corrections, so it must NOT point at a persona
-        # fine-tune (one that injects its own voice instead of answering from context).
-        'repo':      'bartowski/microsoft_Phi-4-mini-instruct-GGUF',
-        'filename':  'microsoft_Phi-4-mini-instruct-Q4_K_M.gguf',
-        'local':     os.path.join(BASE_DIR, 'model', 'phi4mini',
-                                  'microsoft_Phi-4-mini-instruct-Q4_K_M.gguf'),
-        'approx_gb': 2.49,
+        # Generative-model slot (key kept as 'phi' for the code that references it).
+        # Now Qwen2.5-7B-Instruct (Apache-2.0), chosen from the 2026-06 Colab model x
+        # prompt eval: it EXTRACTS answers stated indirectly in narrative/dialogue
+        # (e.g. "a stake is survivable" -> "no, it doesn't kill the vampire") that
+        # Phi-4-mini over-refuses, while still refusing out-of-corpus questions exactly.
+        # Q4_K_M fits a 6 GB GPU at 8192 ctx (~5.0 GiB: 4.07 weights + 0.45 KV + 0.49
+        # compute; small KV thanks to 4-head GQA). Base/uncustomized (no persona
+        # fine-tune). NOTE: training/finetune_phi_rag.ipynb still targets Phi-4-mini --
+        # revisit the fine-tune target if the self-improvement loop moves to Qwen.
+        'repo':      'bartowski/Qwen2.5-7B-Instruct-GGUF',
+        'filename':  'Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+        'local':     os.path.join(BASE_DIR, 'model', 'qwen25-7b',
+                                  'Qwen2.5-7B-Instruct-Q4_K_M.gguf'),
+        'approx_gb': 4.36,
     },
 }
 
@@ -1221,7 +1229,7 @@ class InProcGenBackend:
         from llama_cpp import Llama
         ngl = int(gpu_layers_for_phi())
         where = f'GPU (ngl={ngl})' if ngl > 0 else 'CPU'
-        print(f'[serve] loading phi in-process from {self.path} [{where}] ...', flush=True)
+        print(f'[serve] loading gen model in-process from {self.path} [{where}] ...', flush=True)
         InProcGenBackend._llm = Llama(
             model_path=self.path,
             n_ctx=8192,
@@ -1230,7 +1238,7 @@ class InProcGenBackend:
             n_gpu_layers=ngl,
             verbose=False,
         )
-        print(f'[serve] phi ready (in-process, {where})', flush=True)
+        print(f'[serve] gen model ready (in-process, {where})', flush=True)
         return True
 
     def generate(self, prompt, max_tokens=256, temperature=0.7, top_p=0.9):
@@ -1567,11 +1575,11 @@ def describe_plan(port):
     if _use_inproc():
         print('[serve]   embedder  nomic-embed-text-v1.5 Q4_K_M  in-process  CPU (ngl=0)')
         phi_where = f'GPU (ngl={phi_ngl})' if phi_ngl != '0' else 'CPU (ngl=0)'
-        print(f'[serve]   phi       Phi-4-mini Q4_K_M              in-process  {phi_where}')
+        print(f'[serve]   gen       Qwen2.5-7B Q4_K_M              in-process  {phi_where}')
     else:
         print(f'[serve]   embedder  nomic-embed-text-v1.5 Q4_K_M  port {EMBED_PORT}  CPU (ngl=0)')
         phi_where = f'GPU (ngl={phi_ngl})' if phi_ngl != '0' else 'CPU (ngl=0)'
-        print(f'[serve]   phi       Phi-4-mini Q4_K_M              port {PHI_PORT}  {phi_where}')
+        print(f'[serve]   gen       Qwen2.5-7B Q4_K_M              port {PHI_PORT}  {phi_where}')
     print('[serve]   vector store  SQLite + sqlite-vec  (rag.db, no external server)')
     print('[serve] HF weight sources:')
     for key, cfg in HF_WEIGHTS.items():
@@ -2747,7 +2755,7 @@ No environment variables are used; every setting has a baked-in default.
 
 Backends:
   Embedder  nomic-embed-text-v1.5 Q4_K_M  port 52852  CPU-only (n-gpu-layers 0)
-  Phi       Phi-4-mini Q4_K_M              port 52851  GPU if VRAM fits, else CPU
+  Gen       Qwen2.5-7B Q4_K_M              port 52851  GPU if VRAM fits, else CPU
 """
 
 
