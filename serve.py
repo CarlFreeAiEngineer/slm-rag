@@ -135,7 +135,7 @@ SYSTEM_PROMPT = (
 
 # Number of recent conversation turns to include in the prompt for multi-turn
 # context.  Each turn is one user message + one assistant message.  Capped to
-# avoid overflowing Phi's 4096-token context when chunks are large.
+# avoid overflowing Phi's 8192-token context when chunks are large.
 PROMPT_TURNS = 3
 
 # Default number of chunks to retrieve for each chat question.
@@ -261,8 +261,10 @@ def nvidia_vram_gb():
 
 GPU_TOTAL_GB, GPU_FREE_GB = nvidia_vram_gb()
 
-# Headroom over weight size for KV cache + compute buffers at 4096 context.
-GPU_HEADROOM_GB = 1.3
+# Headroom over weight size for KV cache + compute buffers at 8192 context.
+# Measured on Phi-4-mini Q4_K_M: KV 1024 MiB + compute 416 MiB ~= 1.41 GiB at 8192,
+# so 1.6 GiB reserves a small margin (at 4096 it was ~0.9 GiB under a 1.3 cap).
+GPU_HEADROOM_GB = 1.6
 
 
 def gpu_layers_for_phi():
@@ -1222,7 +1224,7 @@ class InProcGenBackend:
         print(f'[serve] loading phi in-process from {self.path} [{where}] ...', flush=True)
         InProcGenBackend._llm = Llama(
             model_path=self.path,
-            n_ctx=4096,
+            n_ctx=8192,
             n_threads=THREADS,
             n_threads_batch=THREADS,
             n_gpu_layers=ngl,
@@ -1320,7 +1322,7 @@ def build_backends():
             '--model',         phi_gguf,
             '--port',          str(PHI_PORT),
             '--host',          '127.0.0.1',
-            '--ctx-size',      '4096',
+            '--ctx-size',      '8192',
             '--n-gpu-layers',  phi_ngl,
             '--threads',       str(THREADS),
             '--no-webui',
